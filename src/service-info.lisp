@@ -52,6 +52,14 @@
     (16 (make-instance 'aaaa-record :name name :address address
                                     :ttl ttl :cache-flush t))))
 
+(defun address-types (addresses)
+  "The address record types present in ADDRESSES: A for any 4-octet address,
+AAAA for any 16-octet one."
+  (let ((types '()))
+    (when (some (lambda (a) (= 16 (length a))) addresses) (push +type-aaaa+ types))
+    (when (some (lambda (a) (= 4  (length a))) addresses) (push +type-a+ types))
+    types))
+
 (defun service-info-records (info &key (host-ttl *default-host-ttl*)
                                        (other-ttl *default-other-ttl*))
   "Expand INFO into the list of records that advertise it.
@@ -77,7 +85,22 @@ Order: PTR, SRV, TXT, then one A/AAAA per address."
      ;; Unique address records.
      (mapcar (lambda (addr)
                (address-record (service-info-host info) addr host-ttl))
-             (service-info-addresses info)))))
+             (service-info-addresses info))
+     ;; NSEC records assert exactly which types exist, so a listener won't wait
+     ;; on absent ones (the classic case: no AAAA on an IPv4-only host).
+     ;; RFC 6762 §6.1.  next-name is the record's own name; bitmap lists the
+     ;; concrete data types present at that name.
+     (list (make-instance 'nsec-record
+                          :name instance :next-name instance
+                          :cache-flush t :ttl host-ttl
+                          :types (list +type-txt+ +type-srv+)))
+     (let ((atypes (address-types (service-info-addresses info))))
+       (when atypes
+         (list (make-instance 'nsec-record
+                              :name (service-info-host info)
+                              :next-name (service-info-host info)
+                              :cache-flush t :ttl host-ttl
+                              :types atypes)))))))
 
 ;;; Reassembly (browser side): given the records seen for one instance, build a
 ;;; SERVICE-INFO.  Returns NIL if the essential SRV record is missing.
