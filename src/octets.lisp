@@ -1,0 +1,155 @@
+;;;; octets.lisp — the wire codec's lowest layer: a byte-vector read/write
+;;;; cursor plus DNS name (de)compression.  This is the pure, portable core;
+;;;; nothing here touches the network.  Modeled on mafintosh/dns-packet.
+
+(in-package #:0conf)
+
+;;; ---------------------------------------------------------------------------
+;;; String <-> octets.  DNS labels are byte strings; DNS-SD carries UTF-8.
+;;; ---------------------------------------------------------------------------
+
+(defun string->octets (string)
+  (sb-ext:string-to-octets string :external-format :utf-8))
+
+(defun octets->string (octets)
+  (sb-ext:octets-to-string octets :external-format :utf-8))
+
+(defun ensure-simple-octets (vector)
+  "Return VECTOR as a (simple-array (unsigned-byte 8) (*)), copying if needed."
+  (if (typep vector '(simple-array (unsigned-byte 8) (*)))
+      vector
+      (let ((out (make-array (length vector) :element-type '(unsigned-byte 8))))
+        (replace out vector))))
+
+;;; ---------------------------------------------------------------------------
+;;; Writer
+;;; ---------------------------------------------------------------------------
+
+(defstruct (writer (:constructor make-writer))
+  ;; Growable octet buffer.
+  (bytes (make-array 64 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0))
+  ;; Name-suffix (string) -> byte offset, for compression pointers.
+  (labels (make-hash-table :test 'equal)))
+
+(declaim (inline writer-position))
+(defun writer-position (writer)
+  (fill-pointer (writer-bytes writer)))
+
+(defun write-u8 (writer n)
+  (vector-push-extend (logand n #xff) (writer-bytes writer)))
+
+(defun write-u16 (writer n)
+  (write-u8 writer (ldb (byte 8 8) n))
+  (write-u8 writer (ldb (byte 8 0) n)))
+
+(defun write-u32 (writer n)
+  (write-u8 writer (ldb (byte 8 24) n))
+  (write-u8 writer (ldb (byte 8 16) n))
+  (write-u8 writer (ldb (byte 8 8) n))
+  (write-u8 writer (ldb (byte 8 0) n)))
+
+(defun write-octets (writer octets)
+  (loop for b across octets do (write-u8 writer b)))
+
+(defun writer-result (writer)
+  "Snapshot the buffer as a fresh simple octet vector."
+  (let* ((n (writer-position writer))
+         (out (make-array n :element-type '(unsigned-byte 8))))
+    (replace out (writer-bytes writer))))
+
+;;; Domain-name encoding with compression.
+;;;
+;;; NOTE: names are treated as dot-separated strings here.  That is correct for
+;;; hostnames and service types (`_ipp._tcp.local`); DNS-SD *instance* labels can
+;;; legally contain dots and need escaping — a later refinement (represent names
+;;; as label lists internally).  Flagged as TODO.
+(defun split-name (name)
+  (remove "" (uiop:split-string name :separator '(#\.)) :test #'string=))
+
+(defun write-name (writer name)
+  (loop for tail on (split-name name)
+        for suffix = (format nil "~{~A~^.~}" tail)
+        for seen = (gethash suffix (writer-labels writer))
+        do (cond
+             (seen
+              ;; Compression pointer: 0b11xxxxxx xxxxxxxx (top two bits set).
+              (write-u16 writer (logior #xc000 seen))
+              (return-from write-name))
+             (t
+              (let ((pos (writer-position writer)))
+                (when (<= pos #x3fff)          ; only offsets that fit in 14 bits
+                  (setf (gethash suffix (writer-labels writer)) pos)))
+              (let ((label (string->octets (first tail))))
+                (assert (<= (length label) 63) () "DNS label too long: ~S" (first tail))
+                (write-u8 writer (length label))
+                (write-octets writer label)))))
+  ;; Root terminator (only reached when no pointer short-circuited us).
+  (write-u8 writer 0))
+
+;;; ---------------------------------------------------------------------------
+;;; Reader
+;;; ---------------------------------------------------------------------------
+
+(defstruct (reader (:constructor make-reader (bytes)))
+  (bytes #() :type (simple-array (unsigned-byte 8) (*)))
+  (pos 0 :type fixnum))
+
+(defun read-u8 (reader)
+  (prog1 (aref (reader-bytes reader) (reader-pos reader))
+    (incf (reader-pos reader))))
+
+(defun read-u16 (reader)
+  (logior (ash (read-u8 reader) 8) (read-u8 reader)))
+
+(defun read-u32 (reader)
+  (logior (ash (read-u8 reader) 24) (ash (read-u8 reader) 16)
+          (ash (read-u8 reader) 8)  (read-u8 reader)))
+
+(defun read-octets (reader n)
+  (let* ((start (reader-pos reader))
+         (end (+ start n)))
+    (setf (reader-pos reader) end)
+    (subseq (reader-bytes reader) start end)))
+
+(defun read-name (reader)
+  "Read a possibly-compressed domain name, following pointers.  Leaves the
+reader positioned just past the name in the *current* stream (i.e. just past the
+first pointer, if any was taken)."
+  (let ((bytes (reader-bytes reader))
+        (pos (reader-pos reader))
+        (labels '())
+        (jumped nil)
+        (resume nil))
+    (loop
+      (let ((len (aref bytes pos)))
+        (cond
+          ((zerop len)
+           (incf pos)
+           (unless jumped (setf (reader-pos reader) pos))
+           (return))
+          ((= (logand len #xc0) #xc0)
+           (let ((ptr (logior (ash (logand len #x3f) 8) (aref bytes (1+ pos)))))
+             (unless jumped (setf resume (+ pos 2)))
+             (setf jumped t
+                   pos ptr)))
+          (t
+           (incf pos)
+           (push (octets->string (subseq bytes pos (+ pos len))) labels)
+           (incf pos len)))))
+    (when jumped (setf (reader-pos reader) resume))
+    (format nil "~{~A~^.~}" (nreverse labels))))
+
+;;; ---------------------------------------------------------------------------
+;;; IPv4 helpers
+;;; ---------------------------------------------------------------------------
+
+(defun parse-ipv4 (string)
+  "\"192.168.1.5\" -> #(192 168 1 5) as a simple octet vector."
+  (let ((parts (split-name string)))
+    (assert (= 4 (length parts)) () "Not a dotted-quad IPv4 address: ~S" string)
+    (make-array 4 :element-type '(unsigned-byte 8)
+                  :initial-contents (mapcar (lambda (p) (parse-integer p)) parts))))
+
+(defun format-ipv4 (octets)
+  (format nil "~D.~D.~D.~D" (aref octets 0) (aref octets 1)
+          (aref octets 2) (aref octets 3)))

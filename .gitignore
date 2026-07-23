@@ -1,0 +1,6 @@
+# ocicl vendors dependencies here; the lockfile (ocicl.csv) is enough to restore.
+/ocicl/
+
+# Compiled output
+*.fasl
+*.abcl
