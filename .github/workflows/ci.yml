@@ -33,6 +33,17 @@ jobs:
           git clone --depth 1 https://github.com/ocicl/ocicl.git "$RUNNER_TEMP/ocicl"
           ( cd "$RUNNER_TEMP/ocicl" && sbcl --non-interactive --load setup.lisp )
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # Configure ~/.sbclrc so plain `sbcl` loads the ocicl runtime (which
+          # provides ASDF and resolves systems from ocicl.csv) and searches cwd.
+          cat > "$HOME/.sbclrc" <<'RC'
+          #-ocicl
+          (when (probe-file #P"~/.local/share/ocicl/ocicl-runtime.lisp")
+            (load #P"~/.local/share/ocicl/ocicl-runtime.lisp"))
+          (asdf:initialize-source-registry
+            (list :source-registry (list :directory (uiop:getcwd)) :inherit-configuration))
+          RC
+          test -f "$HOME/.local/share/ocicl/ocicl-runtime.lisp" \
+            || { echo "ocicl-runtime.lisp not found"; ls -la "$HOME/.local/share/ocicl" || true; exit 1; }
 
       - name: Restore dependencies
         run: ocicl install
