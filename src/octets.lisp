@@ -114,13 +114,21 @@
 (defun read-name (reader)
   "Read a possibly-compressed domain name, following pointers.  Leaves the
 reader positioned just past the name in the *current* stream (i.e. just past the
-first pointer, if any was taken)."
+first pointer, if any was taken).
+
+Hardened against hostile input: every compression pointer must jump strictly
+backward, which forbids self-references and loops (targets strictly decrease, so
+the chain must terminate) and bounds total work.  Signals an error on a
+forward/self pointer or any read past the end of the message."
   (let ((bytes (reader-bytes reader))
+        (end (length (reader-bytes reader)))
         (pos (reader-pos reader))
         (labels '())
         (jumped nil)
         (resume nil))
     (loop
+      (when (>= pos end)
+        (error "read-name: ran past end of message"))
       (let ((len (aref bytes pos)))
         (cond
           ((zerop len)
@@ -128,12 +136,21 @@ first pointer, if any was taken)."
            (unless jumped (setf (reader-pos reader) pos))
            (return))
           ((= (logand len #xc0) #xc0)
+           (when (>= (1+ pos) end)
+             (error "read-name: truncated compression pointer"))
            (let ((ptr (logior (ash (logand len #x3f) 8) (aref bytes (1+ pos)))))
+             ;; The loop guard: a pointer may only jump to an offset *before*
+             ;; itself.  Well-formed DNS always does (a suffix must have appeared
+             ;; earlier), and our own writer only records earlier offsets.
+             (unless (< ptr pos)
+               (error "read-name: non-backward compression pointer (~D -> ~D)" pos ptr))
              (unless jumped (setf resume (+ pos 2)))
              (setf jumped t
                    pos ptr)))
           (t
            (incf pos)
+           (when (> (+ pos len) end)
+             (error "read-name: label runs past end of message"))
            (push (octets->string (subseq bytes pos (+ pos len))) labels)
            (incf pos len)))))
     (when jumped (setf (reader-pos reader) resume))

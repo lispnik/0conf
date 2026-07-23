@@ -25,6 +25,20 @@
                                (length "printer.local")
                                10))))))
 
+(test read-name-rejects-bad-pointers
+  "Malformed compression pointers must signal, not loop forever."
+  (flet ((octets (&rest bytes)
+           (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                      :initial-contents bytes)))
+    ;; self-pointer: offset 0 -> 0
+    (signals error (read-name (make-reader (octets #xc0 #x00))))
+    ;; forward pointer: offset 0 -> 5
+    (signals error (read-name (make-reader (octets #xc0 #x05 0 0 0 0))))
+    ;; truncated pointer: high byte with no low byte
+    (signals error (read-name (make-reader (octets #xc0))))
+    ;; label length runs past the end of the buffer
+    (signals error (read-name (make-reader (octets #x05 #x61 #x62))))))
+
 (test dns-message-round-trips
   "Encode a query+answer message, decode it, and re-encode byte-for-byte."
   (let* ((msg (make-dns-message
