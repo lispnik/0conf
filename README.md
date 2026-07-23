@@ -74,5 +74,10 @@ OS forbids binding 5353.
   agnostic (AAAA round-trips today). Only `transport.lisp` is v4-only;
   `make-mdns-socket` dispatches on `:family` so an AF_INET6 socket joining
   `ff02::fb` via `IPV6_JOIN_GROUP` drops in beside it. `parse-ipv6` is still a gap.
+- **Negative responses:** `service-info-records` emits NSEC records (instance
+  name → SRV+TXT, host name → the address families present) so announcements let
+  listeners skip absent types like AAAA on an IPv4-only host. Still TODO: having
+  the *responder* attach the matching NSEC when answering a query for a type it
+  doesn't hold (proactive denial on demand, not just in announcements).
 - **Remaining TODOs:** conflict detection/rename during probe, randomized
   20–120ms response delay, and the deferred-1s cache-flush nuance.
