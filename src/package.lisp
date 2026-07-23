@@ -13,7 +13,7 @@
    #:make-writer #:writer-result #:writer-position #:writer-bytes
    #:write-u8 #:write-u16 #:write-u32 #:write-octets #:write-name
    #:make-reader #:reader-pos #:read-u8 #:read-u16 #:read-u32 #:read-octets #:read-name
-   #:parse-ipv4 #:format-ipv4
+   #:parse-ipv4 #:format-ipv4 #:parse-ipv6 #:format-ipv6
    ;; records
    #:resource-record #:rr-name #:rr-type #:rr-class #:rr-cache-flush #:rr-ttl
    #:a-record #:a-address

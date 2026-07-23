@@ -21,7 +21,11 @@
   (defconstant +ip-multicast-if+   9)
   (defconstant +ip-multicast-ttl+  10)
   (defconstant +ip-multicast-loop+ 11)
-  (defconstant +ip-add-membership+ 12))
+  (defconstant +ip-add-membership+ 12)
+  (defconstant +ipproto-ipv6+       41)
+  (defconstant +ipv6-multicast-hops+ 10)
+  (defconstant +ipv6-multicast-loop+ 11)
+  (defconstant +ipv6-join-group+     12))
 
 #+linux
 (progn
@@ -31,7 +35,11 @@
   (defconstant +ip-multicast-if+   32)
   (defconstant +ip-multicast-ttl+  33)
   (defconstant +ip-multicast-loop+ 34)
-  (defconstant +ip-add-membership+ 35))
+  (defconstant +ip-add-membership+ 35)
+  (defconstant +ipproto-ipv6+       41)
+  (defconstant +ipv6-multicast-hops+ 18)
+  (defconstant +ipv6-multicast-loop+ 19)
+  (defconstant +ipv6-join-group+     20))
 
 #-(or darwin linux)
 (error "0conf transport: unsupported OS (need Darwin or Linux socket constants).")
@@ -65,6 +73,22 @@ struct ip_mreq { in_addr imr_multiaddr; in_addr imr_interface; } — 8 bytes."
       (when (minusp rc)
         (error "IP_ADD_MEMBERSHIP for ~A failed" (format-ipv4 group-octets))))))
 
+(defun join-multicast-v6 (fd group-octets ifindex)
+  "IPV6_JOIN_GROUP for GROUP-OCTETS on interface index IFINDEX (0 = default).
+struct ipv6_mreq { in6_addr ipv6mr_multiaddr (16); unsigned int ipv6mr_interface (4) }
+— 20 bytes.  The interface index is a native unsigned int (host byte order)."
+  (sb-alien:with-alien ((mreq (sb-alien:array (sb-alien:unsigned 8) 20)))
+    (dotimes (i 16) (setf (sb-alien:deref mreq i) (aref group-octets i)))
+    (setf (sb-alien:deref mreq 16) (ldb (byte 8 0) ifindex)
+          (sb-alien:deref mreq 17) (ldb (byte 8 8) ifindex)
+          (sb-alien:deref mreq 18) (ldb (byte 8 16) ifindex)
+          (sb-alien:deref mreq 19) (ldb (byte 8 24) ifindex))
+    (let ((rc (%setsockopt fd +ipproto-ipv6+ +ipv6-join-group+
+                           (sb-alien:addr (sb-alien:deref mreq 0))
+                           20)))
+      (when (minusp rc)
+        (error "IPV6_JOIN_GROUP for ~A failed" (format-ipv6 group-octets))))))
+
 (defun set-multicast-interface (fd iface-octets)
   "IP_MULTICAST_IF: choose the egress interface for multicast sends by its IPv4
 address.  Essential on multi-homed / VPN hosts where the default route points at
@@ -85,16 +109,16 @@ a tunnel that carries no multicast — the exact situation on this dev machine."
 (defun make-mdns-socket (&key (family :ipv4) (multicast t) (port +mdns-port+)
                               interface)
   "Open an mDNS UDP socket bound to PORT (5353), joined to the mDNS group.
-FAMILY is :IPV4 (implemented) or :IPV6 (TODO).  INTERFACE, if given as a dotted
-IPv4 string, selects the multicast egress interface (IP_MULTICAST_IF).
+FAMILY is :IPV4 or :IPV6.  For :IPV4, INTERFACE is a dotted-quad string selecting
+the multicast egress interface (IP_MULTICAST_IF); for :IPV6 it is an interface
+*index* (integer) for the group join (0 = default).
 
 NOTE: on macOS 15+ sending/receiving multicast requires the
 `com.apple.developer.networking.multicast` entitlement (and a signed binary);
 an unentitled process gets EHOSTUNREACH on send regardless of routing."
   (ecase family
     (:ipv4 (make-ipv4-mdns-socket multicast port interface))
-    (:ipv6 (error "0conf: IPv6 transport not yet implemented ~
-                   (open AF_INET6, join ff02::fb via IPV6_JOIN_GROUP)."))))
+    (:ipv6 (make-ipv6-mdns-socket multicast port interface))))
 
 (defun make-ipv4-mdns-socket (multicast port interface)
   (let* ((sock (make-instance 'sb-bsd-sockets:inet-socket
@@ -115,20 +139,44 @@ an unentitled process gets EHOSTUNREACH on send regardless of routing."
         (set-sockopt-int fd +ipproto-ip+ +ip-multicast-loop+ 1)))
     (%make-mdns-socket :socket sock :family :ipv4)))
 
+(defun make-ipv6-mdns-socket (multicast port interface)
+  (let* ((sock (make-instance 'sb-bsd-sockets:inet6-socket
+                              :type :datagram :protocol :udp))
+         (fd (sb-bsd-sockets:socket-file-descriptor sock)))
+    (handler-bind ((error (lambda (e) (declare (ignore e))
+                            (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+      (setf (sb-bsd-sockets:sockopt-reuse-address sock) t)
+      (set-sockopt-int fd +sol-socket+ +so-reuseport+ 1)
+      (sb-bsd-sockets:socket-bind sock (make-array 16 :initial-element 0) port)
+      (when multicast
+        (join-multicast-v6 fd (parse-ipv6 +mdns-group-v6+) (or interface 0))
+        (set-sockopt-int fd +ipproto-ipv6+ +ipv6-multicast-hops+ 255)   ; RFC 6762 §11
+        (set-sockopt-int fd +ipproto-ipv6+ +ipv6-multicast-loop+ 1)))
+    (%make-mdns-socket :socket sock :family :ipv6)))
+
 (defun close-mdns-socket (mdns)
   (ignore-errors (sb-bsd-sockets:socket-close (mdns-socket-socket mdns))))
 
 ;;; --- send / receive --------------------------------------------------------
 
-(defun mdns-send (mdns octets &key (host +mdns-group-v4+) (port +mdns-port+))
-  "Send OCTETS to HOST:PORT (defaults: the mDNS group on 5353)."
-  (sb-bsd-sockets:socket-send (mdns-socket-socket mdns)
-                              octets (length octets)
-                              :address (list (parse-ipv4 host) port)))
+(defun mdns-send (mdns octets &key host (port +mdns-port+))
+  "Send OCTETS to HOST:PORT.  HOST defaults to the mDNS group for the socket's
+address family; it is parsed as IPv4 or IPv6 to match."
+  (let* ((family (mdns-socket-family mdns))
+         (host (or host (ecase family
+                          (:ipv4 +mdns-group-v4+)
+                          (:ipv6 +mdns-group-v6+))))
+         (addr (ecase family
+                 (:ipv4 (parse-ipv4 host))
+                 (:ipv6 (parse-ipv6 host)))))
+    (sb-bsd-sockets:socket-send (mdns-socket-socket mdns)
+                                octets (length octets)
+                                :address (list addr port))))
 
 (defun host->string (host)
-  "Normalise the peer address socket-receive hands back into a dotted quad."
-  (cond ((and (vectorp host) (= 4 (length host))) (format-ipv4 host))
+  "Normalise the peer address socket-receive hands back into a string."
+  (cond ((and (vectorp host) (= 4 (length host)))  (format-ipv4 host))
+        ((and (vectorp host) (= 16 (length host))) (format-ipv6 host))
         (t (princ-to-string host))))
 
 (defun mdns-recv (mdns &key (max 9000))

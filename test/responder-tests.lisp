@@ -111,3 +111,47 @@ A record in the Authority section."
     (0conf::handle-packet r (probe-query-for "P._x._tcp.local" "10.0.0.5")
                           "10.0.0.5" 5353)
     (is (not (0conf::responder-conflict r)))))
+
+;;; --- on-demand NSEC in query responses (§6.1) -----------------------------
+
+(defun responder-advertising (info)
+  (let ((r (make-responder)))
+    (setf (0conf::responder-records r) (service-info-records info))
+    r))
+
+(defun query-msg (name qtype)
+  (make-dns-message :questions (list (make-question :name name :qtype qtype))))
+
+(defparameter *ipv4-service*
+  (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                     :port 1 :addresses (list (parse-ipv4 "10.0.0.1"))))
+
+(test nsec-accompanies-positive-answer
+  "A positive answer carries our NSEC for that name in Additional."
+  (let ((r (responder-advertising *ipv4-service*)))
+    (multiple-value-bind (answers additionals)
+        (0conf::build-response r (query-msg "h.local" +type-a+))
+      (is (find-if (lambda (x) (typep x 'a-record)) answers))
+      (is (find-if (lambda (x) (typep x 'nsec-record)) additionals)))))
+
+(test nsec-negative-answer-for-absent-type
+  "IPv4-only host queried for AAAA answers with the NSEC (negative response)."
+  (let ((r (responder-advertising *ipv4-service*)))
+    (multiple-value-bind (answers additionals)
+        (0conf::build-response r (query-msg "h.local" +type-aaaa+))
+      (declare (ignore additionals))
+      (is (= 1 (length answers)))
+      (is (typep (first answers) 'nsec-record))
+      (is (not (member +type-aaaa+ (nsec-types (first answers))))))))
+
+(test nsec-not-negative-when-type-present
+  "Dual-stack host queried for AAAA gives the real AAAA, not a negative NSEC."
+  (let* ((v6 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 2))
+         (info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                  :port 1 :addresses (list (parse-ipv4 "10.0.0.1") v6)))
+         (r (responder-advertising info)))
+    (multiple-value-bind (answers additionals)
+        (0conf::build-response r (query-msg "h.local" +type-aaaa+))
+      (declare (ignore additionals))
+      (is (find-if (lambda (x) (typep x 'aaaa-record)) answers))
+      (is (not (find-if (lambda (x) (typep x 'nsec-record)) answers))))))

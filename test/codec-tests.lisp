@@ -7,8 +7,9 @@
 
 (defun run-tests ()
   "Entry point used by (asdf:test-system :0conf).  Signals on failure."
-  (unless (run! '0conf-tests)
-    (error "0conf test suite failed.")))
+  (let ((0conf::*response-delay* nil))     ; no artificial sleeps under test
+    (unless (run! '0conf-tests)
+      (error "0conf test suite failed."))))
 
 (test name-compression-round-trips
   "A shared suffix (`local`) should compress on write and decompress on read."
@@ -42,6 +43,20 @@ form."
     (let ((w (make-writer)))
       (write-name w name-d)
       (is (string= name-c (read-name (make-reader (writer-result w))))))))
+
+(test parse-ipv6-handles-compression
+  (flet ((v (&rest bytes)
+           (make-array 16 :element-type '(unsigned-byte 8) :initial-contents bytes)))
+    (is (equalp (v 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1) (parse-ipv6 "::1")))
+    (is (equalp (v 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) (parse-ipv6 "::")))
+    (is (equalp (v #xff 2 0 0 0 0 0 0 0 0 0 0 0 0 0 #xfb) (parse-ipv6 "ff02::fb")))
+    (is (equalp (v #x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1)
+                (parse-ipv6 "2001:db8::1")))
+    (is (equalp (v 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1)
+                (parse-ipv6 "0:0:0:0:0:0:0:1")))))
+
+(test format-ipv6-round-trips
+  (is (string= "ff02:0:0:0:0:0:0:fb" (format-ipv6 (parse-ipv6 "ff02::fb")))))
 
 (test read-name-rejects-bad-pointers
   "Malformed compression pointers must signal, not loop forever."

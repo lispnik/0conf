@@ -15,7 +15,7 @@ SBCL only (the multicast transport uses `sb-bsd-sockets` + `sb-alien`).
 | `src/message.lisp` | DNS header + four sections | ✅ |
 | `src/cache.lisp` | TTL cache + cache-flush + goodbye | ✅ |
 | `src/service-info.lisp` | DNS-SD expand ↔ reassemble | ✅ |
-| `src/transport.lisp` | IPv4 multicast UDP (`setsockopt` FFI) | ✅ (IPv6 TODO) |
+| `src/transport.lisp` | IPv4 + IPv6 multicast UDP (`setsockopt` FFI) | ✅ |
 | `src/responder.lisp` | Listener, answer, probe+conflict-rename, announce, goodbye | ✅ |
 | `src/browser.lisp` | `browse` / `browse-once` discovery | ✅ |
 
@@ -70,24 +70,29 @@ OS forbids binding 5353.
   codec follows [mafintosh/dns-packet](https://github.com/mafintosh/dns-packet);
   Apple's [mDNSResponder](https://github.com/apple-oss-distributions/mDNSResponder)
   and the RFCs are the correctness oracle.
-- **IPv6:** the codec/records/cache/DNS-SD layers are already address-family
-  agnostic (AAAA round-trips today). Only `transport.lisp` is v4-only;
-  `make-mdns-socket` dispatches on `:family` so an AF_INET6 socket joining
-  `ff02::fb` via `IPV6_JOIN_GROUP` drops in beside it. `parse-ipv6` is still a gap.
+- **IPv6:** fully supported — `(make-mdns-socket :family :ipv6)` opens an
+  AF_INET6 socket joining `ff02::fb` via `IPV6_JOIN_GROUP`, `mdns-send`/`mdns-recv`
+  are family-aware, and `parse-ipv6`/`format-ipv6` handle `::` compression. The
+  codec/records/cache/DNS-SD layers were already address-family agnostic.
+  (`parse-ipv6` doesn't yet handle embedded-IPv4 `::ffff:1.2.3.4` forms.)
 - **Character set:** all text is UTF-8 (RFC 6762 §16 / RFC 6763). Names are
   normalized to Unicode NFC on encode via SBCL's built-in `sb-unicode` — so
   composed and decomposed spellings of an accented name go on the wire
   identically — with no external dependency.
 - **Negative responses:** `service-info-records` emits NSEC records (instance
-  name → SRV+TXT, host name → the address families present) so announcements let
-  listeners skip absent types like AAAA on an IPv4-only host. Still TODO: having
-  the *responder* attach the matching NSEC when answering a query for a type it
-  doesn't hold (proactive denial on demand, not just in announcements).
+  name → SRV+TXT, host name → the address families present), and the responder
+  also attaches them on demand (RFC 6762 §6.1): a positive answer carries the
+  name's NSEC in Additional, and a query for a type we don't hold at a name we
+  own is answered with the NSEC as a negative response.
+- **Response timing & cache-flush:** multicast responses are delayed a random
+  20–120ms (§6); cache-flush eviction spares records received within the last
+  second so multi-packet responses aren't self-destructive (§10.2).
 - **Probing & conflicts:** the responder probes an instance name three times
   and renames (`Foo` → `Foo (2)`) then re-probes on collision (RFC 6762 §8.1,
   §9). Both cases are handled: a *response* means the name is already owned
   (unconditional conflict), and a simultaneous prober's *query* is resolved by
   lexicographic tiebreaking of the proposed record sets (§8.2) — we rename only
   if our data loses.
-- **Remaining TODOs:** on-demand NSEC in query responses, randomized 20–120ms
-  response delay, and the deferred-1s cache-flush nuance.
+- **Remaining TODOs:** a live async `ServiceBrowser` (add/remove callbacks off a
+  running responder, vs. today's snapshot `browse-once`), a background cache-
+  eviction sweep, embedded-IPv4 IPv6 literals, and CI.

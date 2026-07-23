@@ -7,9 +7,10 @@
 
 (in-package #:0conf)
 
-(defstruct (cache-entry (:constructor make-cache-entry (record expires)))
+(defstruct (cache-entry (:constructor make-cache-entry (record expires added)))
   record
-  (expires 0 :type integer))            ; universal time (seconds) of expiry
+  (expires 0 :type integer)             ; universal time (seconds) of expiry
+  (added 0 :type integer))              ; universal time when received
 
 (defstruct (cache (:constructor make-cache))
   ;; bucket-key string -> list of cache-entry
@@ -44,13 +45,16 @@ Returns :ADDED, :UPDATED, or :REMOVED."
              (remove-if (lambda (e) (rdata-equal (cache-entry-record e) record)) bucket))
        :removed)
       (t
-       ;; cache-flush: this record supersedes differing records in the bucket.
-       ;; (RFC 6762 §10.2 defers the flush by 1s to absorb multi-packet
-       ;; responses; we flush immediately here — TODO for the nuance.)
+       ;; cache-flush: this record supersedes *differing* records of the same
+       ;; name/type/class — but RFC 6762 §10.2 defers the eviction, sparing any
+       ;; record received within the last second so multi-packet responses (a
+       ;; single logical answer split across datagrams) aren't self-destructive.
        (when (rr-cache-flush record)
          (setf bucket
-               (remove-if-not (lambda (e) (rdata-equal (cache-entry-record e) record))
-                              bucket)))
+               (remove-if (lambda (e)
+                            (and (not (rdata-equal (cache-entry-record e) record))
+                                 (<= (cache-entry-added e) (- now 1))))
+                          bucket)))
        (let ((existing (find-if (lambda (e) (rdata-equal (cache-entry-record e) record))
                                 bucket))
              (expires (+ now (rr-ttl record))))
@@ -58,11 +62,12 @@ Returns :ADDED, :UPDATED, or :REMOVED."
            (existing                    ; refresh ttl / replace record in place
             (setf (cache-entry-record existing) record
                   (cache-entry-expires existing) expires
+                  (cache-entry-added existing) now
                   (gethash key (cache-table cache)) bucket)
             :updated)
            (t
             (setf (gethash key (cache-table cache))
-                  (cons (make-cache-entry record expires) bucket))
+                  (cons (make-cache-entry record expires now) bucket))
             :added)))))))
 
 (defun cache-get (cache name &optional type (class +class-in+)

@@ -26,14 +26,25 @@
     (is (= 2 (length (live-a c "host.local" now))))))
 
 (test cache-flush-supersedes
-  ;; A cache-flush record removes differing records of the same name/type.
+  ;; A cache-flush record removes differing records of the same name/type
+  ;; that were received more than a second ago (RFC 6762 §10.2).
   (let ((c (make-cache)) (now 1000))
     (cache-add c (a-rec "host.local" "10.0.0.1") now)
     (cache-add c (a-rec "host.local" "10.0.0.2") now)
-    (cache-add c (a-rec "host.local" "10.0.0.9" :cache-flush t) now)
-    (let ((live (live-a c "host.local" now)))
+    (cache-add c (a-rec "host.local" "10.0.0.9" :cache-flush t) (+ now 2))
+    (let ((live (live-a c "host.local" (+ now 2))))
       (is (= 1 (length live)))
       (is (equalp (parse-ipv4 "10.0.0.9") (a-address (first live)))))))
+
+(test cache-flush-defers-recent
+  ;; §10.2: records received within the last second are NOT flushed, so a
+  ;; multi-packet response (one answer split across datagrams) survives.
+  (let ((c (make-cache)) (now 1000))
+    (cache-add c (a-rec "host.local" "10.0.0.1") now)
+    (cache-add c (a-rec "host.local" "10.0.0.2") now)
+    ;; flush arrives in the same second -> the earlier two are spared
+    (cache-add c (a-rec "host.local" "10.0.0.9" :cache-flush t) now)
+    (is (= 3 (length (live-a c "host.local" now))))))
 
 (test cache-goodbye-removes
   ;; ttl 0 is an mDNS goodbye.

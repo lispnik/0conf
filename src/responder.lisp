@@ -152,21 +152,65 @@ per RFC 6762 known-answer suppression."
                (>= (rr-ttl ka) (floor (rr-ttl record) 2))))
         known-answers))
 
-(defun answer-query (responder message host port)
-  (let ((answers '()))
+(defparameter *response-delay* t
+  "When true, multicast responses are delayed a random 20-120ms (RFC 6762 §6),
+which spreads simultaneous responders and lets answers aggregate.  Bound to NIL
+in tests.")
+
+(defun own-name-p (responder name)
+  (some (lambda (r) (string-equal (rr-name r) name)) (responder-records responder)))
+
+(defun nsec-at (responder name)
+  (find-if (lambda (r) (and (typep r 'nsec-record)
+                            (string-equal (rr-name r) name)))
+           (responder-records responder)))
+
+(defun build-response (responder message)
+  "Compute the response to MESSAGE against our records, as
+(values answers additionals).  Pure — no I/O — so it is unit-testable.
+
+Includes on-demand NSEC (RFC 6762 §6.1): a positive answer carries our NSEC for
+that name in Additional so the querier learns the full type set; a specific-type
+query for a name we own but lack that type is answered with the NSEC as a
+negative response."
+  (let ((answers '())
+        (additionals '()))
     (dolist (question (dns-message-questions message))
-      (dolist (record (responder-records responder))
-        (when (and (record-answers-question-p record question)
-                   (not (known-answer-p record (dns-message-answers message))))
-          (pushnew record answers))))
-    (when answers
-      (let ((reply (encode-message
-                    (make-dns-message :flags +flag-response+
-                                      :answers (nreverse answers)))))
-        (if (and (dns-message-questions message)
-                 (question-unicast-response (first (dns-message-questions message))))
-            (mdns-send (responder-socket responder) reply :host host :port port)
-            (mdns-send (responder-socket responder) reply))))))
+      (let ((matched (remove-if-not
+                      (lambda (r) (and (record-answers-question-p r question)
+                                       (not (known-answer-p
+                                             r (dns-message-answers message)))))
+                      (responder-records responder))))
+        (cond
+          (matched
+           (dolist (r matched) (pushnew r answers))
+           (let ((nsec (nsec-at responder (question-name question))))
+             (when (and nsec (not (member nsec answers)))
+               (pushnew nsec additionals))))
+          ;; Negative answer: we own the name but not the requested type.
+          ((and (/= (question-qtype question) +type-any+)
+                (own-name-p responder (question-name question)))
+           (let ((nsec (nsec-at responder (question-name question))))
+             (when (and nsec (not (member (question-qtype question) (nsec-types nsec))))
+               (pushnew nsec answers)))))))
+    (values (nreverse answers) (nreverse additionals))))
+
+(defun answer-query (responder message host port)
+  (multiple-value-bind (answers additionals) (build-response responder message)
+    (when (or answers additionals)
+      (let* ((questions (dns-message-questions message))
+             (unicast (and questions
+                           (question-unicast-response (first questions))))
+             (reply (encode-message
+                     (make-dns-message :flags +flag-response+
+                                       :answers answers
+                                       :additionals additionals))))
+        (cond
+          (unicast
+           (mdns-send (responder-socket responder) reply :host host :port port))
+          (t
+           (when *response-delay* (sleep (+ 0.02 (random 0.1))))
+           (mdns-send (responder-socket responder) reply)))))))
 
 ;;; --- outbound: register / announce / goodbye -------------------------------
 

@@ -17,3 +17,14 @@
           (close-mdns-socket socket)))
     (error (e)
       (skip "mDNS socket unavailable in this environment: ~A" e))))
+
+(test mdns-ipv6-socket-opens-and-closes
+  "Exercises the AF_INET6 path: SO_REUSEPORT, IPV6_JOIN_GROUP(ff02::fb), and
+IPV6_MULTICAST_HOPS.  Skips if the environment forbids it."
+  (handler-case
+      (let ((socket (make-mdns-socket :family :ipv6)))
+        (unwind-protect
+             (is (typep socket 'mdns-socket))
+          (close-mdns-socket socket)))
+    (error (e)
+      (skip "IPv6 mDNS socket unavailable in this environment: ~A" e))))

@@ -179,3 +179,46 @@ forward/self pointer or any read past the end of the message."
 (defun format-ipv4 (octets)
   (format nil "~D.~D.~D.~D" (aref octets 0) (aref octets 1)
           (aref octets 2) (aref octets 3)))
+
+;;; ---------------------------------------------------------------------------
+;;; IPv6 helpers
+;;; ---------------------------------------------------------------------------
+
+(defun parse-ipv6 (string)
+  "Parse an IPv6 address (with optional \"::\" zero-compression) into a 16-octet
+simple vector.  E.g. \"ff02::fb\" -> #(#xff #x02 0 ... 0 #xfb).
+TODO: embedded-IPv4 forms like \"::ffff:1.2.3.4\" are not handled."
+  (let ((out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+        (dbl (search "::" string)))
+    (flet ((groups (s)
+             (if (zerop (length s))
+                 '()
+                 (mapcar (lambda (g) (parse-integer g :radix 16))
+                         (uiop:split-string s :separator '(#\:))))))
+      (cond
+        (dbl
+         (let ((head (groups (subseq string 0 dbl)))
+               (tail (groups (subseq string (+ dbl 2)))))
+           (assert (<= (+ (length head) (length tail)) 8) ()
+                   "Too many groups in IPv6 address: ~S" string)
+           (loop for g in head for i from 0 by 2
+                 do (setf (aref out i) (ldb (byte 8 8) g)
+                          (aref out (1+ i)) (ldb (byte 8 0) g)))
+           (loop for g in (reverse tail) for i downfrom 14 by 2
+                 do (setf (aref out i) (ldb (byte 8 8) g)
+                          (aref out (1+ i)) (ldb (byte 8 0) g)))))
+        (t
+         (let ((gs (groups string)))
+           (assert (= 8 (length gs)) () "Malformed IPv6 (need 8 groups): ~S" string)
+           (loop for g in gs for i from 0 by 2
+                 do (setf (aref out i) (ldb (byte 8 8) g)
+                          (aref out (1+ i)) (ldb (byte 8 0) g)))))))
+    out))
+
+(defun format-ipv6 (octets)
+  "A colon-hex rendering of a 16-octet vector.  Not the RFC 5952 canonical
+form (no \"::\" compression), but fine for display/logging."
+  (string-downcase
+   (format nil "~{~x~^:~}"
+           (loop for i from 0 below 16 by 2
+                 collect (logior (ash (aref octets i) 8) (aref octets (1+ i)))))))
