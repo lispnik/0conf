@@ -18,6 +18,7 @@
   (records '())                         ; flattened authoritative records
   (lock (bordeaux-threads:make-lock "0conf-responder"))
   (thread nil)
+  (sweeper nil)
   (running nil)
   ;; Conflict detection during probing: PROBING holds the instance name we are
   ;; currently claiming (or NIL); PROBE-RECORDS are the records we propose for it
@@ -31,13 +32,27 @@
 
 ;;; --- listener --------------------------------------------------------------
 
+(defparameter *cache-sweep-interval* 1.0
+  "Seconds between background cache-expiry sweeps.")
+
 (defun start-responder (responder)
   (setf (responder-socket responder) (make-mdns-socket)
         (responder-running responder) t
         (responder-thread responder)
         (bordeaux-threads:make-thread (lambda () (responder-loop responder))
-                                      :name "0conf-responder"))
+                                      :name "0conf-responder")
+        (responder-sweeper responder)
+        (bordeaux-threads:make-thread (lambda () (sweeper-loop responder))
+                                      :name "0conf-sweeper"))
   responder)
+
+(defun sweeper-loop (responder)
+  "Periodically drop expired cache entries so removals actually happen on time
+(and memory doesn't grow).  Wakes often enough that STOP-RESPONDER is prompt."
+  (loop while (responder-running responder) do
+    (sleep *cache-sweep-interval*)
+    (bordeaux-threads:with-lock-held ((responder-lock responder))
+      (ignore-errors (cache-expire (responder-cache responder))))))
 
 (defun responder-loop (responder)
   (loop while (responder-running responder) do
@@ -52,7 +67,7 @@
   (setf (responder-running responder) nil)
   (when (responder-socket responder)
     (close-mdns-socket (responder-socket responder)))
-  (let ((thread (responder-thread responder)))
+  (dolist (thread (list (responder-thread responder) (responder-sweeper responder)))
     (when (and thread (bordeaux-threads:thread-alive-p thread))
       (ignore-errors (bordeaux-threads:join-thread thread))))
   responder)
@@ -64,7 +79,8 @@
     (if (response-p message)
         (let ((records (append (dns-message-answers message)
                                (dns-message-additionals message))))
-          (dolist (r records) (cache-add (responder-cache responder) r))
+          (bordeaux-threads:with-lock-held ((responder-lock responder))
+            (dolist (r records) (cache-add (responder-cache responder) r)))
           (detect-conflict responder records))
         (progn
           (tiebreak-probe responder message)

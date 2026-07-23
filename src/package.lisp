@@ -48,4 +48,5 @@
    #:responder #:make-responder #:start-responder #:stop-responder
    #:register-service #:unregister-service
    #:browse #:browse-once
+   #:service-browser #:browse-services #:stop-browse
    #:start #:stop))

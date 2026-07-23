@@ -17,15 +17,24 @@ SBCL only (the multicast transport uses `sb-bsd-sockets` + `sb-alien`).
 | `src/service-info.lisp` | DNS-SD expand ↔ reassemble | ✅ |
 | `src/transport.lisp` | IPv4 + IPv6 multicast UDP (`setsockopt` FFI) | ✅ |
 | `src/responder.lisp` | Listener, answer, probe+conflict-rename, announce, goodbye | ✅ |
-| `src/browser.lisp` | `browse` / `browse-once` discovery | ✅ |
+| `src/browser.lisp` | `browse-once` snapshot + live async `browse-services` | ✅ |
 
 ## Use
 
 ```lisp
 (ql:quickload :0conf)   ; or (asdf:load-system :0conf)
 
-;; Discover printers on the LAN for 3s:
+;; One-shot snapshot — discover printers on the LAN for 3s:
 (0conf:browse-once "_ipp._tcp.local" :timeout 3.0)
+
+;; Live browsing — callbacks as services come and go (needs a running responder):
+(let* ((r (0conf:start-responder (0conf:make-responder)))
+       (b (0conf:browse-services r "_ipp._tcp.local"
+            :on-add    (lambda (info) (format t "+ ~A~%" (0conf:service-instance-name info)))
+            :on-remove (lambda (name) (format t "- ~A~%" name)))))
+  ;; ... later ...
+  (0conf:stop-browse b)
+  (0conf:stop r))
 
 ;; Advertise a service:
 (let ((r (0conf:start
@@ -93,6 +102,11 @@ OS forbids binding 5353.
   (unconditional conflict), and a simultaneous prober's *query* is resolved by
   lexicographic tiebreaking of the proposed record sets (§8.2) — we rename only
   if our data loses.
-- **Remaining TODOs:** a live async `ServiceBrowser` (add/remove callbacks off a
-  running responder, vs. today's snapshot `browse-once`), a background cache-
-  eviction sweep, embedded-IPv4 IPv6 literals, and CI.
+- **Live browsing:** `browse-services` attaches to a running responder and fires
+  add/update/remove callbacks as instances appear, change, and vanish. Discovery
+  uses a backing-off PTR query (§5.2) with known-answer suppression; the current
+  set is recomputed from the cache on a short poll and diffed. A background
+  sweeper expires stale cache entries so removals happen on time. Cross-thread
+  cache access is guarded by the responder lock.
+- **Remaining TODOs:** embedded-IPv4 IPv6 literals (`::ffff:1.2.3.4`), TTL-refresh
+  queries at 80/85/90/95% of ttl for long-lived browses, and CI.

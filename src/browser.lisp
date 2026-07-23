@@ -61,3 +61,117 @@ for each instance found.  Returns the thread."
      (dolist (info (browse-once type :timeout timeout :interface interface))
        (funcall callback info)))
    :name "0conf-browse"))
+
+;;; ---------------------------------------------------------------------------
+;;; Live async ServiceBrowser
+;;;
+;;; Attaches to a running RESPONDER (reusing its listener + cache), keeps a live
+;;; picture of one service type, and fires callbacks as instances appear, change,
+;;; and vanish.  Discovery uses a backing-off PTR query (RFC 6762 §5.2); the
+;;; current set is recomputed from the cache on a short poll and diffed against
+;;; what we last reported.  Removals come "for free": the cache filters expired
+;;; records and treats a ttl-0 goodbye as deletion, so a vanished instance simply
+;;; stops appearing in the diff.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (service-browser (:constructor %make-service-browser))
+  responder
+  type
+  on-add on-update on-remove
+  (known (make-hash-table :test 'equal))   ; instance-name -> last service-info
+  (thread nil)
+  (running nil)
+  (query-interval 1))                       ; current backoff, seconds
+
+(defun address-set-equal (as bs)
+  (and (= (length as) (length bs))
+       (every (lambda (a) (find a bs :test #'equalp)) as)))
+
+(defun txt-equal (a b)
+  (equal (sort (copy-alist a) #'string< :key #'car)
+         (sort (copy-alist b) #'string< :key #'car)))
+
+(defun service-info-equal (a b)
+  "Do two SERVICE-INFOs describe the same instance state (host/port/txt/addrs)?"
+  (and (string-equal (service-info-host a) (service-info-host b))
+       (= (service-info-port a) (service-info-port b))
+       (txt-equal (service-info-txt a) (service-info-txt b))
+       (address-set-equal (service-info-addresses a) (service-info-addresses b))))
+
+(defun fire (callback arg)
+  (when callback (ignore-errors (funcall callback arg))))
+
+(defun send-browse-query (browser)
+  "Send the PTR query, including the PTR answers we already know so responders
+that would only repeat them stay quiet (known-answer suppression)."
+  (let* ((responder (service-browser-responder browser))
+         (type (service-browser-type browser))
+         (known (bordeaux-threads:with-lock-held ((responder-lock responder))
+                  (cache-get (responder-cache responder) type +type-ptr+))))
+    (mdns-send (responder-socket responder)
+               (encode-message
+                (make-dns-message
+                 :questions (list (make-question :name type :qtype +type-ptr+))
+                 :answers known)))))
+
+(defun diff-and-notify (browser)
+  "Recompute the live instance set from the cache and fire add/update/remove."
+  (let* ((responder (service-browser-responder browser))
+         (type (service-browser-type browser))
+         (current (bordeaux-threads:with-lock-held ((responder-lock responder))
+                    (assemble-services (responder-cache responder) type)))
+         (known (service-browser-known browser))
+         (seen (make-hash-table :test 'equal)))
+    (dolist (info current)
+      (let* ((name (service-instance-name info))
+             (prev (gethash name known)))
+        (setf (gethash name seen) t)
+        (cond
+          ((null prev)
+           (setf (gethash name known) info)
+           (fire (service-browser-on-add browser) info))
+          ((not (service-info-equal prev info))
+           (setf (gethash name known) info)
+           (fire (service-browser-on-update browser) info)))))
+    (let ((gone '()))
+      (maphash (lambda (name info)
+                 (declare (ignore info))
+                 (unless (gethash name seen) (push name gone)))
+               known)
+      (dolist (name gone)
+        (remhash name known)
+        (fire (service-browser-on-remove browser) name)))))
+
+(defun browser-loop (browser poll)
+  (let ((next-query 0))
+    (loop while (service-browser-running browser) do
+      (when (>= (get-internal-real-time) next-query)
+        (ignore-errors (send-browse-query browser))
+        (setf next-query (+ (get-internal-real-time)
+                            (* (service-browser-query-interval browser)
+                               internal-time-units-per-second))
+              (service-browser-query-interval browser)
+              (min 3600 (* 2 (service-browser-query-interval browser)))))
+      (diff-and-notify browser)
+      (sleep poll))))
+
+(defun browse-services (responder type &key on-add on-update on-remove (poll 1.0))
+  "Start a live browser for service TYPE on a running RESPONDER.  Calls
+ON-ADD / ON-UPDATE with a SERVICE-INFO, and ON-REMOVE with the instance name, as
+instances appear, change, and disappear.  Returns a SERVICE-BROWSER; stop it with
+STOP-BROWSE."
+  (let ((browser (%make-service-browser
+                  :responder responder :type type
+                  :on-add on-add :on-update on-update :on-remove on-remove)))
+    (setf (service-browser-running browser) t
+          (service-browser-thread browser)
+          (bordeaux-threads:make-thread (lambda () (browser-loop browser poll))
+                                        :name "0conf-browser"))
+    browser))
+
+(defun stop-browse (browser)
+  (setf (service-browser-running browser) nil)
+  (let ((thread (service-browser-thread browser)))
+    (when (and thread (bordeaux-threads:thread-alive-p thread))
+      (ignore-errors (bordeaux-threads:join-thread thread))))
+  browser)
