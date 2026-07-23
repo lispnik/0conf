@@ -16,7 +16,7 @@ SBCL only (the multicast transport uses `sb-bsd-sockets` + `sb-alien`).
 | `src/cache.lisp` | TTL cache + cache-flush + goodbye | ✅ |
 | `src/service-info.lisp` | DNS-SD expand ↔ reassemble | ✅ |
 | `src/transport.lisp` | IPv4 multicast UDP (`setsockopt` FFI) | ✅ (IPv6 TODO) |
-| `src/responder.lisp` | Listener, answer, probe, announce, goodbye | ✅ (conflict-rename TODO) |
+| `src/responder.lisp` | Listener, answer, probe+conflict-rename, announce, goodbye | ✅ |
 | `src/browser.lisp` | `browse` / `browse-once` discovery | ✅ |
 
 ## Use
@@ -83,5 +83,10 @@ OS forbids binding 5353.
   listeners skip absent types like AAAA on an IPv4-only host. Still TODO: having
   the *responder* attach the matching NSEC when answering a query for a type it
   doesn't hold (proactive denial on demand, not just in announcements).
-- **Remaining TODOs:** conflict detection/rename during probe, randomized
-  20–120ms response delay, and the deferred-1s cache-flush nuance.
+- **Probing:** the responder probes an instance name three times and, on
+  detecting another host answering for it, renames (`Foo` → `Foo (2)`) and
+  re-probes (RFC 6762 §8.1, §9). Still TODO: simultaneous-prober lexicographic
+  tiebreaking (§8.2) — two hosts probing the same name at the same instant.
+- **Remaining TODOs:** on-demand NSEC in query responses, simultaneous-prober
+  tiebreaking, randomized 20–120ms response delay, and the deferred-1s
+  cache-flush nuance.

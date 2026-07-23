@@ -18,7 +18,12 @@
   (records '())                         ; flattened authoritative records
   (lock (bordeaux-threads:make-lock "0conf-responder"))
   (thread nil)
-  (running nil))
+  (running nil)
+  ;; Conflict detection during probing: PROBING holds the instance name we are
+  ;; currently claiming (or NIL), and the listener sets CONFLICT if it sees
+  ;; someone else answering for that name.
+  (probing nil)
+  (conflict nil))
 
 (defun response-p (message)
   (logbitp 15 (dns-message-flags message)))   ; QR bit
@@ -56,10 +61,21 @@
 (defun handle-packet (responder octets host port)
   (let ((message (decode-message octets)))
     (if (response-p message)
-        (dolist (r (append (dns-message-answers message)
-                           (dns-message-additionals message)))
-          (cache-add (responder-cache responder) r))
+        (let ((records (append (dns-message-answers message)
+                               (dns-message-additionals message))))
+          (dolist (r records) (cache-add (responder-cache responder) r))
+          (detect-conflict responder records))
         (answer-query responder message host port))))
+
+(defun detect-conflict (responder records)
+  "If we are probing a name and someone else authoritatively answers for it,
+flag a conflict so PROBE-NAME renames.  (Simultaneous-prober lexicographic
+tiebreaking per RFC 6762 §8.2 is a TODO; this handles an already-claimed name.)"
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (let ((probing (responder-probing responder)))
+      (when (and probing
+                 (some (lambda (r) (string-equal (rr-name r) probing)) records))
+        (setf (responder-conflict responder) t)))))
 
 (defun record-answers-question-p (record question)
   (and (string-equal (rr-name record) (question-name question))
@@ -95,17 +111,54 @@ per RFC 6762 known-answer suppression."
 
 ;;; --- outbound: register / announce / goodbye -------------------------------
 
-(defun probe-name (responder name)
-  "Send three probes 250ms apart for NAME.
-TODO: watch responses during this window and rename on conflict."
-  (dotimes (i 3)
-    (mdns-send (responder-socket responder)
-               (encode-message
-                (make-dns-message
-                 :questions (list (make-question :name name :qtype +type-any+
-                                                 :unicast-response t)))))
-    (sleep 0.25))
-  name)
+(defun next-instance-name (name)
+  "Bump a service-instance label per RFC 6762 §9:
+\"Name\" -> \"Name (2)\", \"Name (2)\" -> \"Name (3)\"."
+  (let ((close (1- (length name))))
+    (if (and (plusp (length name)) (char= (char name close) #\)))
+        (let ((open (position #\( name :from-end t :end close)))
+          (if (and open
+                   (> close (1+ open))                          ; at least one digit
+                   (every #'digit-char-p (subseq name (1+ open) close))
+                   (>= open 1) (char= (char name (1- open)) #\Space))
+              (format nil "~A(~D)"
+                      (subseq name 0 open)                       ; keeps the trailing space
+                      (1+ (parse-integer name :start (1+ open) :end close)))
+              (format nil "~A (2)" name)))
+        (format nil "~A (2)" name))))
+
+(defun send-probe (responder name info)
+  "One probe: a unicast-response query for NAME with our proposed records in the
+Authority section (for tiebreaking), per RFC 6762 §8.1."
+  (mdns-send (responder-socket responder)
+             (encode-message
+              (make-dns-message
+               :questions (list (make-question :name name :qtype +type-any+
+                                               :unicast-response t))
+               :authorities (service-info-records info)))))
+
+(defun probe-name (responder info &key (max-attempts 20))
+  "Probe INFO's instance name three times (250ms apart).  On a detected conflict,
+rename via NEXT-INSTANCE-NAME (mutating INFO) and probe again.  Returns INFO once
+a name is successfully claimed."
+  (dotimes (attempt max-attempts
+                    (error "0conf: no free name for ~S after ~D attempts"
+                           (service-info-name info) max-attempts))
+    (let ((name (service-instance-name info)))
+      (bordeaux-threads:with-lock-held ((responder-lock responder))
+        (setf (responder-conflict responder) nil
+              (responder-probing responder) name))
+      (unwind-protect
+           (dotimes (i 3)
+             (send-probe responder name info)
+             (sleep 0.25)
+             (when (responder-conflict responder) (return)))
+        (bordeaux-threads:with-lock-held ((responder-lock responder))
+          (setf (responder-probing responder) nil)))
+      (if (responder-conflict responder)
+          (setf (service-info-name info)
+                (next-instance-name (service-info-name info)))
+          (return info)))))
 
 (defun announce (responder records)
   "Unsolicited responses so listeners learn the records immediately.
@@ -117,9 +170,11 @@ RFC 6762 §8.3 asks for at least two, at least 1s apart."
       (sleep 1))))
 
 (defun register-service (responder info &key (probe t))
-  "Advertise INFO.  Probes the instance name, then announces its record set."
+  "Advertise INFO.  Probes the instance name (renaming on conflict), then
+announces its record set.  Records are built *after* probing so a rename is
+reflected."
+  (when probe (probe-name responder info))     ; may rename INFO in place
   (let ((records (service-info-records info)))
-    (when probe (probe-name responder (service-instance-name info)))
     (bordeaux-threads:with-lock-held ((responder-lock responder))
       (push info (responder-services responder))
       (setf (responder-records responder)
