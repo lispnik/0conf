@@ -83,10 +83,11 @@ OS forbids binding 5353.
   listeners skip absent types like AAAA on an IPv4-only host. Still TODO: having
   the *responder* attach the matching NSEC when answering a query for a type it
   doesn't hold (proactive denial on demand, not just in announcements).
-- **Probing:** the responder probes an instance name three times and, on
-  detecting another host answering for it, renames (`Foo` → `Foo (2)`) and
-  re-probes (RFC 6762 §8.1, §9). Still TODO: simultaneous-prober lexicographic
-  tiebreaking (§8.2) — two hosts probing the same name at the same instant.
-- **Remaining TODOs:** on-demand NSEC in query responses, simultaneous-prober
-  tiebreaking, randomized 20–120ms response delay, and the deferred-1s
-  cache-flush nuance.
+- **Probing & conflicts:** the responder probes an instance name three times
+  and renames (`Foo` → `Foo (2)`) then re-probes on collision (RFC 6762 §8.1,
+  §9). Both cases are handled: a *response* means the name is already owned
+  (unconditional conflict), and a simultaneous prober's *query* is resolved by
+  lexicographic tiebreaking of the proposed record sets (§8.2) — we rename only
+  if our data loses.
+- **Remaining TODOs:** on-demand NSEC in query responses, randomized 20–120ms
+  response delay, and the deferred-1s cache-flush nuance.

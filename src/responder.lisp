@@ -20,9 +20,10 @@
   (thread nil)
   (running nil)
   ;; Conflict detection during probing: PROBING holds the instance name we are
-  ;; currently claiming (or NIL), and the listener sets CONFLICT if it sees
-  ;; someone else answering for that name.
+  ;; currently claiming (or NIL); PROBE-RECORDS are the records we propose for it
+  ;; (for §8.2 tiebreaking); the listener sets CONFLICT on collision.
   (probing nil)
+  (probe-records '())
   (conflict nil))
 
 (defun response-p (message)
@@ -65,17 +66,75 @@
                                (dns-message-additionals message))))
           (dolist (r records) (cache-add (responder-cache responder) r))
           (detect-conflict responder records))
-        (answer-query responder message host port))))
+        (progn
+          (tiebreak-probe responder message)
+          (answer-query responder message host port)))))
 
 (defun detect-conflict (responder records)
-  "If we are probing a name and someone else authoritatively answers for it,
-flag a conflict so PROBE-NAME renames.  (Simultaneous-prober lexicographic
-tiebreaking per RFC 6762 §8.2 is a TODO; this handles an already-claimed name.)"
+  "A *response* answering for the name we're probing means someone already owns
+it — an unconditional conflict, so PROBE-NAME renames."
   (bordeaux-threads:with-lock-held ((responder-lock responder))
     (let ((probing (responder-probing responder)))
       (when (and probing
                  (some (lambda (r) (string-equal (rr-name r) probing)) records))
         (setf (responder-conflict responder) t)))))
+
+;;; --- §8.2 lexicographic tiebreaking ---------------------------------------
+
+(defun compare-octets (a b)
+  "Lexicographic comparison of two octet vectors: -1, 0, or 1 (shorter is
+earlier when one is a prefix of the other)."
+  (let ((n (min (length a) (length b))))
+    (dotimes (i n)
+      (let ((x (aref a i)) (y (aref b i)))
+        (cond ((< x y) (return-from compare-octets -1))
+              ((> x y) (return-from compare-octets 1)))))
+    (signum (- (length a) (length b)))))
+
+(defun compare-records (a b)
+  "RFC 6762 §8.2.1 pairwise record comparison: class (sans cache-flush bit),
+then type, then a raw byte comparison of the uncompressed rdata."
+  (let ((ca (logand (rr-class a) (lognot +cache-flush-bit+)))
+        (cb (logand (rr-class b) (lognot +cache-flush-bit+))))
+    (cond ((/= ca cb) (signum (- ca cb)))
+          ((/= (rr-type a) (rr-type b)) (signum (- (rr-type a) (rr-type b))))
+          ;; RDATA-OCTETS uses a fresh writer, so embedded names come out
+          ;; uncompressed — exactly the canonical form §8.2 wants.
+          (t (compare-octets (rdata-octets a) (rdata-octets b))))))
+
+(defun compare-record-sets (ours theirs)
+  "Compare two record sets in canonical order, from OURS's perspective.
+Returns :WIN, :LOSE, or :TIE (RFC 6762 §8.2)."
+  (flet ((canonical (set)
+           (sort (copy-list set) (lambda (x y) (minusp (compare-records x y))))))
+    (let ((a (canonical ours))
+          (b (canonical theirs)))
+      (loop for ra in a for rb in b
+            for c = (compare-records ra rb)
+            unless (zerop c)
+              do (return-from compare-record-sets (if (plusp c) :win :lose)))
+      ;; identical prefix: the set with more records is lexicographically later
+      (case (signum (- (length a) (length b)))
+        (1 :win) (-1 :lose) (0 :tie)))))
+
+(defun tiebreak-probe (responder message)
+  "A simultaneous prober's *query* carries its proposed records in the Authority
+section.  If we're probing the same name and their set is lexicographically
+later, we lose and must rename (RFC 6762 §8.2).  A tie (identical data) is not a
+conflict."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (let ((probing (responder-probing responder)))
+      (when (and probing
+                 (some (lambda (q) (string-equal (question-name q) probing))
+                       (dns-message-questions message)))
+        (flet ((at-name (records)
+                 (remove-if-not (lambda (r) (string-equal (rr-name r) probing))
+                                records)))
+          (let ((theirs (at-name (dns-message-authorities message)))
+                (ours (at-name (responder-probe-records responder))))
+            (when (and theirs
+                       (eq :lose (compare-record-sets ours theirs)))
+              (setf (responder-conflict responder) t))))))))
 
 (defun record-answers-question-p (record question)
   (and (string-equal (rr-name record) (question-name question))
@@ -144,17 +203,20 @@ a name is successfully claimed."
   (dotimes (attempt max-attempts
                     (error "0conf: no free name for ~S after ~D attempts"
                            (service-info-name info) max-attempts))
-    (let ((name (service-instance-name info)))
+    (let ((name (service-instance-name info))
+          (records (service-info-records info)))
       (bordeaux-threads:with-lock-held ((responder-lock responder))
         (setf (responder-conflict responder) nil
-              (responder-probing responder) name))
+              (responder-probing responder) name
+              (responder-probe-records responder) records))
       (unwind-protect
            (dotimes (i 3)
              (send-probe responder name info)
              (sleep 0.25)
              (when (responder-conflict responder) (return)))
         (bordeaux-threads:with-lock-held ((responder-lock responder))
-          (setf (responder-probing responder) nil)))
+          (setf (responder-probing responder) nil
+                (responder-probe-records responder) '())))
       (if (responder-conflict responder)
           (setf (service-info-name info)
                 (next-instance-name (service-info-name info)))
