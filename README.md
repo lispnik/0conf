@@ -1,5 +1,7 @@
 # 0conf
 
+[![CI](https://github.com/lispnik/0conf/actions/workflows/ci.yml/badge.svg)](https://github.com/lispnik/0conf/actions/workflows/ci.yml)
+
 A pure Common Lisp implementation of **mDNS** ([RFC 6762](https://www.rfc-editor.org/rfc/rfc6762))
 and **DNS-SD** ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763)) — "zeroconf"
 service advertisement and discovery on the local link.
