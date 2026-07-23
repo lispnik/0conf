@@ -74,6 +74,10 @@ OS forbids binding 5353.
   agnostic (AAAA round-trips today). Only `transport.lisp` is v4-only;
   `make-mdns-socket` dispatches on `:family` so an AF_INET6 socket joining
   `ff02::fb` via `IPV6_JOIN_GROUP` drops in beside it. `parse-ipv6` is still a gap.
+- **Character set:** all text is UTF-8 (RFC 6762 §16 / RFC 6763). Names are
+  normalized to Unicode NFC on encode via SBCL's built-in `sb-unicode` — so
+  composed and decomposed spellings of an accented name go on the wire
+  identically — with no external dependency.
 - **Negative responses:** `service-info-records` emits NSEC records (instance
   name → SRV+TXT, host name → the address families present) so announcements let
   listeners skip absent types like AAAA on an IPv4-only host. Still TODO: having

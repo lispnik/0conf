@@ -11,6 +11,13 @@
 (defun string->octets (string)
   (sb-ext:string-to-octets string :external-format :utf-8))
 
+(defun normalize-name (name)
+  "Return NAME in Unicode Normalization Form C (NFC), which RFC 6762 §16
+recommends for mDNS names so that composed and decomposed spellings of the same
+name produce identical bytes on the wire and compare equal.  ASCII is
+unaffected.  Uses SBCL's built-in sb-unicode (no external dependency)."
+  (sb-unicode:normalize-string name :nfc))
+
 (defun octets->string (octets)
   (sb-ext:octets-to-string octets :external-format :utf-8))
 
@@ -67,7 +74,9 @@
   (remove "" (uiop:split-string name :separator '(#\.)) :test #'string=))
 
 (defun write-name (writer name)
-  (loop for tail on (split-name name)
+  ;; Normalize to NFC before encoding (RFC 6762 §16).  Compression suffixes are
+  ;; therefore compared in normalized form too, so it stays consistent.
+  (loop for tail on (split-name (normalize-name name))
         for suffix = (format nil "~{~A~^.~}" tail)
         for seen = (gethash suffix (writer-labels writer))
         do (cond

@@ -25,6 +25,24 @@
                                (length "printer.local")
                                10))))))
 
+(test names-are-nfc-normalized
+  "RFC 6762 §16: names go on the wire in NFC, so composed and decomposed
+spellings of the same name encode to identical bytes and decode to the composed
+form."
+  (let* ((composed   (coerce (list (code-char #xe9)) 'string))          ; é (U+00E9)
+         (decomposed (coerce (list #\e (code-char #x301)) 'string))     ; e + U+0301
+         (name-c (concatenate 'string "caf" composed ".local"))
+         (name-d (concatenate 'string "caf" decomposed ".local")))
+    ;; Both spellings produce the same wire bytes.
+    (let ((wc (make-writer)) (wd (make-writer)))
+      (write-name wc name-c)
+      (write-name wd name-d)
+      (is (equalp (writer-result wc) (writer-result wd))))
+    ;; And the decomposed input comes back as the composed (NFC) form.
+    (let ((w (make-writer)))
+      (write-name w name-d)
+      (is (string= name-c (read-name (make-reader (writer-result w))))))))
+
 (test read-name-rejects-bad-pointers
   "Malformed compression pointers must signal, not loop forever."
   (flet ((octets (&rest bytes)
