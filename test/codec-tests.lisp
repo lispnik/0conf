@@ -134,6 +134,21 @@ form."
          (name (read-name (make-reader (coerce wire '(simple-array (unsigned-byte 8) (*)))))))
     (is (string= (coerce (list (code-char #xe9)) 'string) name))))
 
+(test decode-survives-truncation
+  "Truncating a valid message at any prefix length decodes or signals cleanly —
+never a raw array-index error or corrupt data (the reader is bounds-checked)."
+  (let* ((full (encode-message
+                (make-dns-message
+                 :id 1
+                 :questions (list (make-question :name "_x._tcp.local" :qtype +type-ptr+))
+                 :answers (list (make-instance 'a-record :name "h.local"
+                                               :address (parse-ipv4 "1.2.3.4"))))))
+         (handled 0))
+    (dotimes (n (1+ (length full)))
+      (handler-case (progn (decode-message (subseq full 0 n)) (incf handled))
+        (error () (incf handled))))
+    (is (= (1+ (length full)) handled))))
+
 (test read-name-rejects-bad-pointers
   "Malformed compression pointers must signal, not loop forever."
   (flet ((octets (&rest bytes)

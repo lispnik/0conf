@@ -142,12 +142,12 @@ OS forbids binding 5353.
 - **Legacy unicast queries (§6.7):** a query from a source port other than 5353
   gets a unicast reply with the query id echoed, the question repeated, and TTLs
   capped at 10s.
-- **Probing & conflicts:** the responder probes an instance name three times
-  and renames (`Foo` → `Foo (2)`) then re-probes on collision (RFC 6762 §8.1,
-  §9). Both cases are handled: a *response* means the name is already owned
-  (unconditional conflict), and a simultaneous prober's *query* is resolved by
-  lexicographic tiebreaking of the proposed record sets (§8.2) — we rename only
-  if our data loses.
+- **Probing & conflicts:** the responder probes both the service instance name
+  and the host name, renaming on collision (`Foo` → `Foo (2)`, `myhost.local` →
+  `myhost-2.local`) and re-probing (RFC 6762 §8.1, §9). Both cases are handled: a
+  *response* means the name is already owned (unconditional conflict), and a
+  simultaneous prober's *query* is resolved by lexicographic tiebreaking of the
+  proposed record sets (§8.2) — we rename only if our data loses.
 - **Live browsing:** `browse-services` attaches to a running responder and fires
   add/update/remove callbacks as instances appear, change, and vanish. Discovery
   uses a backing-off PTR query (§5.2) with known-answer suppression, plus

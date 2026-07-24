@@ -61,6 +61,30 @@ trip the conflict flag here (simultaneous-prober tiebreak is a separate TODO)."
     (0conf::handle-packet r (a-response-for "Printer._ipp._tcp.local") "10.0.0.1" 5353)
     (is (not (0conf::responder-conflict r)))))
 
+(test next-host-name-bumps
+  "RFC 6762 §9 host renaming: append/increment a \"-N\" suffix on the first label."
+  (is (string= "myhost-2.local"  (0conf::next-host-name "myhost.local")))
+  (is (string= "myhost-3.local"  (0conf::next-host-name "myhost-2.local")))
+  (is (string= "my-host-2.local" (0conf::next-host-name "my-host.local"))))
+
+(test host-name-conflict-detected
+  "The host name is probed/defended like an instance name: a response for the
+host name we're probing is a conflict."
+  (let ((r (make-responder)))
+    (setf (0conf::responder-probing r) "myhost.local")
+    (0conf::handle-packet r (a-response-for "myhost.local") "10.0.0.9" 5353)
+    (is (0conf::responder-conflict r))))
+
+(test pending-ka-expires
+  "Orphaned continuation known-answers are evicted after their TTL, not leaked."
+  (let ((r (make-responder)))
+    (0conf::buffer-known-answers r "10.0.0.2" (list (a-at "h.local" "10.0.0.1")) 1000)
+    (0conf::expire-pending-ka r 1002)                 ; within 5s ttl -> kept
+    (is (0conf::take-known-answers r "10.0.0.2"))
+    (0conf::buffer-known-answers r "10.0.0.2" (list (a-at "h.local" "10.0.0.1")) 1000)
+    (0conf::expire-pending-ka r 1010)                 ; past ttl -> evicted
+    (is (null (0conf::take-known-answers r "10.0.0.2")))))
+
 ;;; --- §8.2 lexicographic tiebreaking ---------------------------------------
 
 (defun a-at (name ip)

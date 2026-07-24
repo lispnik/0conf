@@ -134,8 +134,13 @@ backslash escaping and dropping empty (root/trailing) labels."
   (pos 0 :type fixnum))
 
 (defun read-u8 (reader)
-  (prog1 (aref (reader-bytes reader) (reader-pos reader))
-    (incf (reader-pos reader))))
+  ;; Bounds-check every read so a truncated packet signals a clean error rather
+  ;; than a low-level array-index error (read-u16/u32/octets all build on this).
+  (let ((pos (reader-pos reader)))
+    (when (>= pos (length (reader-bytes reader)))
+      (error "read: past end of message"))
+    (prog1 (aref (reader-bytes reader) pos)
+      (incf (reader-pos reader)))))
 
 (defun read-u16 (reader)
   (logior (ash (read-u8 reader) 8) (read-u8 reader)))
@@ -147,6 +152,8 @@ backslash escaping and dropping empty (root/trailing) labels."
 (defun read-octets (reader n)
   (let* ((start (reader-pos reader))
          (end (+ start n)))
+    (when (> end (length (reader-bytes reader)))
+      (error "read-octets: ~D bytes past end of message" n))
     (setf (reader-pos reader) end)
     (subseq (reader-bytes reader) start end)))
 

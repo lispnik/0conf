@@ -26,7 +26,10 @@
   (conflict nil)
   ;; Known-answers from continuation packets (a TC'd known-answer list spilling
   ;; across datagrams), buffered per source host until the query is answered.
-  (pending-ka (make-hash-table :test 'equal)))
+  (pending-ka (make-hash-table :test 'equal))
+  ;; Host names we've already probed and claimed (so we probe each once even
+  ;; when several services share a host).
+  (claimed-hosts (make-hash-table :test 'equal)))
 
 (defun response-p (message)
   (logbitp 15 (dns-message-flags message)))   ; QR bit
@@ -90,7 +93,8 @@ doesn't grow).  Wakes often enough that STOP-RESPONDER is prompt."
   (loop while (responder-running responder) do
     (sleep *cache-sweep-interval*)
     (bordeaux-threads:with-lock-held ((responder-lock responder))
-      (ignore-errors (cache-expire (responder-cache responder))))))
+      (ignore-errors (cache-expire (responder-cache responder))))
+    (ignore-errors (expire-pending-ka responder))))
 
 (defun responder-loop (responder socket)
   ;; Poll with a timeout rather than a plain blocking recv: on Linux, closing the
@@ -127,16 +131,35 @@ list that a querier split across packets with the TC bit (RFC 6762 §7.2)."
   (and (null (dns-message-questions message))
        (dns-message-answers message)))
 
-(defun buffer-known-answers (responder host records)
+(defparameter *pending-ka-ttl* 5
+  "Seconds a buffered continuation known-answer list survives without a matching
+query before the sweeper evicts it (so orphaned continuations don't leak).")
+
+(defun buffer-known-answers (responder host records &optional (now (get-universal-time)))
+  "Buffer RECORDS as continuation known-answers for HOST, stamped with NOW.
+Each bucket is (added-time . records)."
   (bordeaux-threads:with-lock-held ((responder-lock responder))
-    (setf (gethash host (responder-pending-ka responder))
-          (append records (gethash host (responder-pending-ka responder))))))
+    (let ((entry (gethash host (responder-pending-ka responder))))
+      (setf (gethash host (responder-pending-ka responder))
+            (cons now (append records (cdr entry)))))))
 
 (defun take-known-answers (responder host)
   "Return and clear the buffered continuation known-answers for HOST."
   (bordeaux-threads:with-lock-held ((responder-lock responder))
-    (prog1 (gethash host (responder-pending-ka responder))
+    (prog1 (cdr (gethash host (responder-pending-ka responder)))
       (remhash host (responder-pending-ka responder)))))
+
+(defun expire-pending-ka (responder &optional (now (get-universal-time)))
+  "Drop buffered continuation known-answers older than *PENDING-KA-TTL* — an
+orphaned continuation (no query ever followed) must not linger forever."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (let ((ka (responder-pending-ka responder))
+          (dead '()))
+      (maphash (lambda (host entry)
+                 (when (< (car entry) (- now *pending-ka-ttl*))
+                   (push host dead)))
+               ka)
+      (dolist (host dead) (remhash host ka)))))
 
 (defun handle-packet (responder octets host port &optional (socket (responder-primary-socket responder)))
   (let ((message (decode-message octets)))
@@ -388,36 +411,51 @@ Authority section (for tiebreaking), per RFC 6762 §8.1."
                                                :unicast-response t))
                :authorities (service-info-records info)))))
 
+(defun bump-hostname-label (label)
+  "\"myhost\" -> \"myhost-2\", \"myhost-2\" -> \"myhost-3\" (RFC 6762 §9 hostnames)."
+  (let ((dash (position #\- label :from-end t)))
+    (if (and dash (< (1+ dash) (length label))
+             (every #'digit-char-p (subseq label (1+ dash))))
+        (format nil "~A~D" (subseq label 0 (1+ dash))
+                (1+ (parse-integer label :start (1+ dash))))
+        (format nil "~A-2" label))))
+
+(defun next-host-name (host)
+  "Bump the first label of a host name: \"myhost.local\" -> \"myhost-2.local\"."
+  (let ((dot (position #\. host)))
+    (if dot
+        (format nil "~A~A" (bump-hostname-label (subseq host 0 dot)) (subseq host dot))
+        (bump-hostname-label host))))
+
 (defparameter *probe-conflict-backoff* 1.0
   "Seconds to wait after a probe conflict before probing a new name (§8.1).")
 
-(defun probe-name (responder info &key (max-attempts 20))
-  "Probe INFO's instance name three times (250ms apart).  On a detected conflict,
-wait a second, rename via NEXT-INSTANCE-NAME (mutating INFO), and probe again.
-Returns INFO once a name is successfully claimed."
+(defun probe-cycle (responder name info)
+  "Probe NAME three times (250ms apart), watching for a conflict.  Returns T if a
+conflict was detected during the window."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (setf (responder-conflict responder) nil
+          (responder-probing responder) name
+          (responder-probe-records responder) (service-info-records info)))
+  (unwind-protect
+       (dotimes (i 3)
+         (send-probe responder name info)
+         (sleep 0.25)
+         (when (responder-conflict responder) (return)))
+    (bordeaux-threads:with-lock-held ((responder-lock responder))
+      (setf (responder-probing responder) nil
+            (responder-probe-records responder) '())))
+  (responder-conflict responder))
+
+(defun claim-name (responder info name-fn rename-fn &key (max-attempts 20))
+  "Probe (funcall NAME-FN INFO); on conflict wait, RENAME-FN (mutating INFO), and
+retry until the name is free (RFC 6762 §8/§9).  Returns INFO."
   (dotimes (attempt max-attempts
                     (error "0conf: no free name for ~S after ~D attempts"
-                           (service-info-name info) max-attempts))
-    (let ((name (service-instance-name info))
-          (records (service-info-records info)))
-      (bordeaux-threads:with-lock-held ((responder-lock responder))
-        (setf (responder-conflict responder) nil
-              (responder-probing responder) name
-              (responder-probe-records responder) records))
-      (unwind-protect
-           (dotimes (i 3)
-             (send-probe responder name info)
-             (sleep 0.25)
-             (when (responder-conflict responder) (return)))
-        (bordeaux-threads:with-lock-held ((responder-lock responder))
-          (setf (responder-probing responder) nil
-                (responder-probe-records responder) '())))
-      (if (responder-conflict responder)
-          (progn
-            (sleep *probe-conflict-backoff*)     ; rate-limit re-probing (§8.1)
-            (setf (service-info-name info)
-                  (next-instance-name (service-info-name info))))
-          (return info)))))
+                           (funcall name-fn info) max-attempts))
+    (if (probe-cycle responder (funcall name-fn info) info)
+        (progn (sleep *probe-conflict-backoff*) (funcall rename-fn info))
+        (return info))))
 
 (defun announce (responder records)
   "Unsolicited responses so listeners learn the records immediately.
@@ -429,10 +467,20 @@ RFC 6762 §8.3 asks for at least two, at least 1s apart."
       (sleep 1))))
 
 (defun register-service (responder info &key (probe t))
-  "Advertise INFO.  Probes the instance name (renaming on conflict), then
-announces its record set.  Records are built *after* probing so a rename is
-reflected."
-  (when probe (probe-name responder info))     ; may rename INFO in place
+  "Advertise INFO.  Probes the instance name AND the host name (renaming each on
+conflict, RFC 6762 §8/§9), then announces its record set.  Records are built
+*after* probing so any rename is reflected."
+  (when probe
+    ;; Claim the unique instance name.
+    (claim-name responder info #'service-instance-name
+                (lambda (i) (setf (service-info-name i)
+                                  (next-instance-name (service-info-name i)))))
+    ;; Claim the host name, once per host (many services can share it).
+    (unless (gethash (service-info-host info) (responder-claimed-hosts responder))
+      (claim-name responder info #'service-info-host
+                  (lambda (i) (setf (service-info-host i)
+                                    (next-host-name (service-info-host i)))))
+      (setf (gethash (service-info-host info) (responder-claimed-hosts responder)) t)))
   (let ((records (service-info-records info)))
     (bordeaux-threads:with-lock-held ((responder-lock responder))
       (push info (responder-services responder))
