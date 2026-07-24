@@ -10,14 +10,12 @@
 (in-package #:0conf)
 
 (defstruct (responder (:constructor make-responder))
-  socket                                ; IPv4 socket
-  socket6                               ; IPv6 socket (may be NIL)
+  (sockets '())                         ; MDNS-SOCKETs (per interface, both families)
+  (threads '())                         ; one listener thread per socket
   (cache (make-cache))
   (services '())                        ; list of SERVICE-INFO we advertise
   (records '())                         ; flattened authoritative records
   (lock (bordeaux-threads:make-lock "0conf-responder"))
-  (thread nil)                          ; v4 listener
-  (thread6 nil)                         ; v6 listener
   (sweeper nil)
   (running nil)
   ;; Conflict detection during probing: PROBING holds the instance name we are
@@ -33,9 +31,10 @@
 (defun response-p (message)
   (logbitp 15 (dns-message-flags message)))   ; QR bit
 
-(defun responder-sockets (responder)
-  "The live sockets (v4, and v6 if present)."
-  (remove nil (list (responder-socket responder) (responder-socket6 responder))))
+(defun responder-primary-socket (responder)
+  "A socket to use as a default reply socket in code paths that don't carry one
+(NIL in pure unit tests, where nothing is actually sent)."
+  (first (responder-sockets responder)))
 
 (defun broadcast (responder octets)
   "Send OCTETS out every socket (each address family's multicast group)."
@@ -50,23 +49,36 @@
 (defparameter *listen-poll-interval* 1.0
   "Max seconds a listener blocks per iteration before re-checking RUNNING.")
 
+(defun open-interface-sockets ()
+  "Open a v4 and/or v6 mDNS socket per usable interface, joined on that specific
+interface.  Best-effort: a failed join on one interface never aborts the others.
+Falls back to a single INADDR_ANY socket per family when enumeration yields
+nothing usable (or getifaddrs is unavailable)."
+  (let ((socks '()))
+    (dolist (iface (ignore-errors (list-interfaces)))
+      (when (net-interface-ipv4 iface)
+        (let ((s (ignore-errors (make-ipv4-mdns-socket-on iface))))
+          (when s (push s socks))))
+      (when (net-interface-has-v6 iface)
+        (let ((s (ignore-errors (make-ipv6-mdns-socket-on iface))))
+          (when s (push s socks)))))
+    (or (nreverse socks)
+        (remove nil (list (ignore-errors (make-mdns-socket))
+                          (ignore-errors (make-mdns-socket :family :ipv6)))))))
+
 (defun start-responder (responder &key socket)
-  "Open the mDNS socket(s) and start a listener per socket plus the sweeper.
-SOCKET, if given, is used as the sole (IPv4) socket for testing over loopback;
-otherwise a v4 socket is opened and a v6 socket is attempted best-effort."
-  (setf (responder-socket responder) (or socket (make-mdns-socket))
-        (responder-socket6 responder) (unless socket
-                                        (ignore-errors (make-mdns-socket :family :ipv6)))
+  "Open the mDNS sockets and start a listener thread per socket plus the sweeper.
+SOCKET, if given, is used as the sole socket (testing over loopback, no
+enumeration); otherwise one socket is opened per usable interface per family."
+  (setf (responder-sockets responder) (if socket (list socket) (open-interface-sockets))
         (responder-running responder) t)
-  (setf (responder-thread responder)
-        (bordeaux-threads:make-thread
-         (lambda () (responder-loop responder (responder-socket responder)))
-         :name "0conf-responder-v4"))
-  (when (responder-socket6 responder)
-    (setf (responder-thread6 responder)
-          (bordeaux-threads:make-thread
-           (lambda () (responder-loop responder (responder-socket6 responder)))
-           :name "0conf-responder-v6")))
+  (setf (responder-threads responder)
+        (loop for s in (responder-sockets responder)
+              for i from 0
+              collect (let ((s s))
+                        (bordeaux-threads:make-thread
+                         (lambda () (responder-loop responder s))
+                         :name (format nil "0conf-responder-~D" i)))))
   (setf (responder-sweeper responder)
         (bordeaux-threads:make-thread (lambda () (sweeper-loop responder))
                                       :name "0conf-sweeper"))
@@ -102,8 +114,7 @@ doesn't grow).  Wakes often enough that STOP-RESPONDER is prompt."
   (setf (responder-running responder) nil)
   (dolist (socket (responder-sockets responder))
     (close-mdns-socket socket))
-  (dolist (thread (list (responder-thread responder) (responder-thread6 responder)
-                        (responder-sweeper responder)))
+  (dolist (thread (cons (responder-sweeper responder) (responder-threads responder)))
     (when (and thread (bordeaux-threads:thread-alive-p thread))
       (ignore-errors (bordeaux-threads:join-thread thread))))
   responder)
@@ -127,7 +138,7 @@ list that a querier split across packets with the TC bit (RFC 6762 §7.2)."
     (prog1 (gethash host (responder-pending-ka responder))
       (remhash host (responder-pending-ka responder)))))
 
-(defun handle-packet (responder octets host port &optional (socket (responder-socket responder)))
+(defun handle-packet (responder octets host port &optional (socket (responder-primary-socket responder)))
   (let ((message (decode-message octets)))
     (cond
       ((response-p message)
@@ -313,7 +324,7 @@ cache match up front (e.g. our own looped-back records), which we keep."
                     (cache-has-answer-p cache r)))
              answers))
 
-(defun answer-query (responder message host port &optional (socket (responder-socket responder)))
+(defun answer-query (responder message host port &optional (socket (responder-primary-socket responder)))
   (multiple-value-bind (answers additionals) (build-response responder message)
     (when (or answers additionals)
       (let* ((questions (dns-message-questions message))

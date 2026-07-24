@@ -17,7 +17,7 @@ SBCL only (the multicast transport uses `sb-bsd-sockets` + `sb-alien`).
 | `src/message.lisp` | DNS header + four sections | ✅ |
 | `src/cache.lisp` | TTL cache + cache-flush + goodbye | ✅ |
 | `src/service-info.lisp` | DNS-SD expand ↔ reassemble | ✅ |
-| `src/transport.lisp` | IPv4 + IPv6 multicast UDP (`setsockopt` FFI) | ✅ |
+| `src/transport.lisp` | Per-interface IPv4+IPv6 multicast (`getifaddrs`+`setsockopt` FFI) | ✅ |
 | `src/responder.lisp` | Listener, answer, probe+conflict-rename, announce, goodbye | ✅ |
 | `src/browser.lisp` | `browse-once` snapshot + live async `browse-services` | ✅ |
 
@@ -109,11 +109,14 @@ OS forbids binding 5353.
   codec follows [mafintosh/dns-packet](https://github.com/mafintosh/dns-packet);
   Apple's [mDNSResponder](https://github.com/apple-oss-distributions/mDNSResponder)
   and the RFCs are the correctness oracle.
-- **IPv6 / dual-stack:** `make-mdns-socket :family :ipv6` opens an AF_INET6
-  socket joining `ff02::fb` via `IPV6_JOIN_GROUP`; `start-responder` runs both a
-  v4 and (best-effort) v6 listener, and answers on the socket a query arrived on.
-  `mdns-send`/`mdns-recv` are family-aware and `parse-ipv6`/`format-ipv6` handle
-  `::` compression. (`parse-ipv6` doesn't yet handle embedded-IPv4 forms.)
+- **Per-interface, dual-stack:** `list-interfaces` enumerates usable NICs via
+  `getifaddrs` (skipping loopback and point-to-point/VPN tunnels); `start-responder`
+  opens one IPv4 and/or IPv6 socket **per interface**, joins the group on that
+  specific interface, pins egress to it (`IP_MULTICAST_IF`), runs a listener per
+  socket, answers on the socket a query arrived on, and broadcasts announcements
+  out every interface — correct on multi-homed / VPN hosts. Best-effort: a failed
+  join on one NIC never aborts the others, and it falls back to a single
+  all-interfaces socket per family when enumeration yields nothing.
 - **Character set & names:** all text is UTF-8 (RFC 6762 §16 / RFC 6763), with
   names normalized to Unicode NFC — on encode *and* decode — via SBCL's built-in
   `sb-unicode` (no external dependency). Names use RFC 4343 presentation escaping,
@@ -153,5 +156,6 @@ OS forbids binding 5353.
   from the cache on a short poll and diffed. A background sweeper expires stale
   cache entries so removals happen on time. Cross-thread cache access is guarded
   by the responder lock.
-- **Remaining TODOs:** full per-interface multicast on multi-homed hosts (the
-  responder currently opens one socket per family bound to all interfaces).
+- **Remaining follow-ups:** dynamic interface re-enumeration (a NIC appearing
+  after startup is missed until restart), receive-side interface attribution
+  (`IP_PKTINFO`/`IP_RECVIF`), and a socket-count cap on hosts with very many NICs.

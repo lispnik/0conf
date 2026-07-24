@@ -25,7 +25,8 @@
   (defconstant +ipproto-ipv6+       41)
   (defconstant +ipv6-multicast-hops+ 10)
   (defconstant +ipv6-multicast-loop+ 11)
-  (defconstant +ipv6-join-group+     12))
+  (defconstant +ipv6-join-group+     12)
+  (defconstant +af-inet6+           30))     ; Darwin
 
 #+linux
 (progn
@@ -39,10 +40,18 @@
   (defconstant +ipproto-ipv6+       41)
   (defconstant +ipv6-multicast-hops+ 18)
   (defconstant +ipv6-multicast-loop+ 19)
-  (defconstant +ipv6-join-group+     20))
+  (defconstant +ipv6-join-group+     20)
+  (defconstant +af-inet6+           10))     ; Linux
 
 #-(or darwin linux)
 (error "0conf transport: unsupported OS (need Darwin or Linux socket constants).")
+
+;;; Interface enumeration constants (shared across Darwin/Linux).
+(defconstant +af-inet+          2)
+(defconstant +iff-up+           #x1)
+(defconstant +iff-loopback+     #x8)
+(defconstant +iff-pointopoint+  #x10)
+(defconstant +iff-multicast+    #x8000)
 
 ;;; --- setsockopt() shim -----------------------------------------------------
 
@@ -61,12 +70,13 @@
       (when (minusp rc)
         (error "setsockopt(level=~D opt=~D val=~D) failed" level optname value)))))
 
-(defun join-multicast-v4 (fd group-octets)
-  "IP_ADD_MEMBERSHIP for GROUP-OCTETS on the default interface (INADDR_ANY).
+(defun join-multicast-v4 (fd group-octets &optional (iface-octets #(0 0 0 0)))
+  "IP_ADD_MEMBERSHIP for GROUP-OCTETS on the interface with address IFACE-OCTETS
+(default INADDR_ANY = the system's default interface).
 struct ip_mreq { in_addr imr_multiaddr; in_addr imr_interface; } — 8 bytes."
   (sb-alien:with-alien ((mreq (sb-alien:array (sb-alien:unsigned 8) 8)))
     (dotimes (i 4) (setf (sb-alien:deref mreq i) (aref group-octets i)))
-    (dotimes (i 4) (setf (sb-alien:deref mreq (+ 4 i)) 0))   ; INADDR_ANY
+    (dotimes (i 4) (setf (sb-alien:deref mreq (+ 4 i)) (aref iface-octets i)))
     (let ((rc (%setsockopt fd +ipproto-ip+ +ip-add-membership+
                            (sb-alien:addr (sb-alien:deref mreq 0))
                            8)))
@@ -100,11 +110,100 @@ a tunnel that carries no multicast — the exact situation on this dev machine."
       (when (minusp rc)
         (error "IP_MULTICAST_IF ~A failed" (format-ipv4 iface-octets))))))
 
+;;; --- interface enumeration (getifaddrs) ------------------------------------
+;;;
+;;; struct ifaddrs is laid out identically on Darwin arm64 and Linux (64-bit):
+;;; next(ptr) name(ptr) flags(uint) <pad> addr(ptr) ...  We let SBCL compute the
+;;; pad via define-alien-type.  The one platform-divergent part is the sockaddr
+;;; header: Darwin has sa_len(1)+sa_family(1); Linux has sa_family(2).  The IPv4
+;;; address always sits at sockaddr_in offset 4.
+
+(sb-alien:define-alien-type nil
+  (sb-alien:struct ifaddrs
+    (ifa-next    (sb-alien:* (sb-alien:struct ifaddrs)))
+    (ifa-name    sb-alien:c-string)
+    (ifa-flags   sb-alien:unsigned-int)
+    (ifa-addr    (sb-alien:* (sb-alien:unsigned 8)))
+    (ifa-netmask (sb-alien:* (sb-alien:unsigned 8)))
+    (ifa-dstaddr (sb-alien:* (sb-alien:unsigned 8)))
+    (ifa-data    (sb-alien:* (sb-alien:unsigned 8)))))
+
+(sb-alien:define-alien-routine ("getifaddrs" %getifaddrs) sb-alien:int
+  (ifap (sb-alien:* (sb-alien:* (sb-alien:struct ifaddrs)))))
+
+(sb-alien:define-alien-routine ("freeifaddrs" %freeifaddrs) sb-alien:void
+  (ifa (sb-alien:* (sb-alien:struct ifaddrs))))
+
+(sb-alien:define-alien-routine ("if_nametoindex" %if-nametoindex) sb-alien:unsigned-int
+  (ifname sb-alien:c-string))
+
+(defstruct net-interface
+  name          ; interface name string, e.g. "en0"
+  index         ; if_nametoindex value (for IPv6 joins), or NIL
+  ipv4          ; a 4-octet vector, or NIL
+  (has-v6 nil)) ; true if the interface has an IPv6 address
+
+(defun sockaddr-family (sap)
+  #+darwin (sb-sys:sap-ref-8 sap 1)      ; sa_len then sa_family
+  #+linux  (sb-sys:sap-ref-16 sap 0))    ; sa_family (u16)
+
+(defun list-interfaces (&key include-loopback (multicast-only t))
+  "Enumerate usable network interfaces via getifaddrs(3).  Returns a list of
+NET-INTERFACE (name, index, ipv4, has-v6).  Best-effort: returns NIL if
+getifaddrs fails.  By default filters to up, multicast-capable, non-loopback
+interfaces; pass :INCLUDE-LOOPBACK T / :MULTICAST-ONLY NIL to widen (used by
+tests, since loopback is always present)."
+  (sb-alien:with-alien ((head (sb-alien:* (sb-alien:struct ifaddrs))))
+    (unless (zerop (%getifaddrs (sb-alien:addr head)))
+      (return-from list-interfaces nil))
+    (unwind-protect
+         (let ((by-name (make-hash-table :test 'equal))
+               (order '()))
+           (flet ((entry (name)
+                    (or (gethash name by-name)
+                        (progn (push name order)
+                               (setf (gethash name by-name)
+                                     (make-net-interface :name name))))))
+             (loop for node = head then (sb-alien:slot node 'ifa-next)
+                   until (sb-alien:null-alien node)
+                   do (let ((addr (sb-alien:slot node 'ifa-addr))
+                            (flags (sb-alien:slot node 'ifa-flags))
+                            (name (sb-alien:slot node 'ifa-name)))
+                        (when (and (not (sb-alien:null-alien addr))
+                                   (logtest flags +iff-up+)
+                                   (or (not multicast-only) (logtest flags +iff-multicast+))
+                                   ;; skip VPN/point-to-point tunnels for mDNS
+                                   (or (not multicast-only)
+                                       (not (logtest flags +iff-pointopoint+)))
+                                   (or include-loopback (not (logtest flags +iff-loopback+))))
+                          (let* ((sap (sb-alien:alien-sap addr))
+                                 (family (sockaddr-family sap)))
+                            (cond
+                              ((= family +af-inet+)
+                               (let ((e (entry name)))
+                                 (unless (net-interface-ipv4 e)
+                                   (setf (net-interface-ipv4 e)
+                                         (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+                                           (dotimes (i 4)
+                                             (setf (aref v i) (sb-sys:sap-ref-8 sap (+ 4 i))))
+                                           v)))))
+                              ((= family +af-inet6+)
+                               (setf (net-interface-has-v6 (entry name)) t))))))))
+           (loop for name in (nreverse order)
+                 for e = (gethash name by-name)
+                 do (let ((idx (%if-nametoindex name)))
+                      (setf (net-interface-index e) (if (plusp idx) idx nil)))
+                 collect e))
+      (%freeifaddrs head))))
+
 ;;; --- the socket ------------------------------------------------------------
 
 (defstruct (mdns-socket (:constructor %make-mdns-socket))
   socket
-  (family :ipv4))
+  (family :ipv4)
+  (interface-name nil)      ; NIC name, or NIL for the INADDR_ANY fallback socket
+  (interface-address nil)   ; IPv4 octets this socket egresses on, or NIL
+  (interface-index nil))    ; IPv6 interface index, or NIL
 
 (defun make-mdns-socket (&key (family :ipv4) (multicast t) (port +mdns-port+)
                               interface)
@@ -153,6 +252,44 @@ an unentitled process gets EHOSTUNREACH on send regardless of routing."
         (set-sockopt-int fd +ipproto-ipv6+ +ipv6-multicast-hops+ 255)   ; RFC 6762 §11
         (set-sockopt-int fd +ipproto-ipv6+ +ipv6-multicast-loop+ 1)))
     (%make-mdns-socket :socket sock :family :ipv6)))
+
+;;; --- per-interface sockets (dual-stack, multi-homed) -----------------------
+
+(defun make-ipv4-mdns-socket-on (iface &optional (port +mdns-port+))
+  "An IPv4 mDNS socket bound to all interfaces but with the group joined on, and
+egress pinned to, the interface IFACE (a NET-INTERFACE with an :ipv4 address)."
+  (let* ((addr (net-interface-ipv4 iface))
+         (sock (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp))
+         (fd (sb-bsd-sockets:socket-file-descriptor sock)))
+    (handler-bind ((error (lambda (e) (declare (ignore e))
+                            (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+      (setf (sb-bsd-sockets:sockopt-reuse-address sock) t)
+      (set-sockopt-int fd +sol-socket+ +so-reuseport+ 1)
+      (sb-bsd-sockets:socket-bind sock #(0 0 0 0) port)
+      (join-multicast-v4 fd (parse-ipv4 +mdns-group-v4+) addr)   ; join on this NIC
+      (set-multicast-interface fd addr)                          ; egress on this NIC
+      (set-sockopt-int fd +ipproto-ip+ +ip-multicast-ttl+ 255)
+      (set-sockopt-int fd +ipproto-ip+ +ip-multicast-loop+ 1))
+    (%make-mdns-socket :socket sock :family :ipv4
+                       :interface-name (net-interface-name iface)
+                       :interface-address addr)))
+
+(defun make-ipv6-mdns-socket-on (iface &optional (port +mdns-port+))
+  "An IPv6 mDNS socket with the group joined on interface index (net-interface-index IFACE)."
+  (let* ((index (net-interface-index iface))
+         (sock (make-instance 'sb-bsd-sockets:inet6-socket :type :datagram :protocol :udp))
+         (fd (sb-bsd-sockets:socket-file-descriptor sock)))
+    (handler-bind ((error (lambda (e) (declare (ignore e))
+                            (ignore-errors (sb-bsd-sockets:socket-close sock)))))
+      (setf (sb-bsd-sockets:sockopt-reuse-address sock) t)
+      (set-sockopt-int fd +sol-socket+ +so-reuseport+ 1)
+      (sb-bsd-sockets:socket-bind sock (make-array 16 :initial-element 0) port)
+      (join-multicast-v6 fd (parse-ipv6 +mdns-group-v6+) (or index 0))
+      (set-sockopt-int fd +ipproto-ipv6+ +ipv6-multicast-hops+ 255)
+      (set-sockopt-int fd +ipproto-ipv6+ +ipv6-multicast-loop+ 1))
+    (%make-mdns-socket :socket sock :family :ipv6
+                       :interface-name (net-interface-name iface)
+                       :interface-index index)))
 
 (defun close-mdns-socket (mdns)
   (ignore-errors (sb-bsd-sockets:socket-close (mdns-socket-socket mdns))))

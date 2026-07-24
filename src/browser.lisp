@@ -108,7 +108,7 @@ that would only repeat them stay quiet (known-answer suppression)."
          (type (service-browser-type browser))
          (known (bordeaux-threads:with-lock-held ((responder-lock responder))
                   (cache-get (responder-cache responder) type +type-ptr+))))
-    (mdns-send (responder-socket responder)
+    (broadcast responder
                (encode-message
                 (make-dns-message
                  :questions (list (make-question :name type :qtype +type-ptr+))

@@ -45,6 +45,8 @@
    ;; transport
    #:mdns-socket #:make-mdns-socket #:mdns-send #:mdns-recv #:mdns-recv-timeout
    #:close-mdns-socket
+   #:list-interfaces #:net-interface #:net-interface-name #:net-interface-index
+   #:net-interface-ipv4 #:net-interface-has-v6
    ;; responder / browser / public API
    #:responder #:make-responder #:start-responder #:stop-responder
    #:register-service #:unregister-service
