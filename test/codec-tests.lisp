@@ -58,6 +58,41 @@ form."
 (test format-ipv6-round-trips
   (is (string= "ff02:0:0:0:0:0:0:fb" (format-ipv6 (parse-ipv6 "ff02::fb")))))
 
+(test format-ipv4-round-trips
+  (is (string= "192.168.1.5" (format-ipv4 (parse-ipv4 "192.168.1.5")))))
+
+(test malformed-address-input-signals
+  (signals error (parse-ipv4 "1.2.3"))                    ; too few octets
+  (signals error (parse-ipv6 "1:2:3"))                    ; too few groups
+  (signals error (parse-ipv6 "1:2:3:4:5:6:7:8:9"))        ; too many groups
+  (signals error (parse-ipv6 "1:2:3:4:5:6:7:8::9")))      ; too many even with ::
+
+(test oversized-label-signals
+  ;; A DNS label may be at most 63 octets.
+  (signals error
+    (write-name (make-writer)
+                (concatenate 'string (make-string 64 :initial-element #\a) ".local"))))
+
+(test decode-accepts-non-simple-octets
+  ;; DECODE-MESSAGE must copy a non-simple input (list, adjustable vector).
+  (let* ((bytes (encode-message (make-dns-message :id 7)))
+         (as-list (coerce bytes 'list))
+         (adjustable (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                                :adjustable t :initial-contents bytes)))
+    (is (= 7 (dns-message-id (decode-message as-list))))
+    (is (= 7 (dns-message-id (decode-message adjustable))))))
+
+(test message-with-additionals-round-trips
+  ;; Exercises the Additional-section write/read paths.
+  (let* ((msg (make-dns-message
+               :answers (list (make-instance 'a-record :name "h.local"
+                                             :address (parse-ipv4 "10.0.0.1")))
+               :additionals (list (make-instance 'a-record :name "h2.local"
+                                                 :address (parse-ipv4 "10.0.0.2")))))
+         (d (decode-message (encode-message msg))))
+    (is (= 1 (length (dns-message-additionals d))))
+    (is (string= "h2.local" (rr-name (first (dns-message-additionals d)))))))
+
 (test read-name-rejects-bad-pointers
   "Malformed compression pointers must signal, not loop forever."
   (flet ((octets (&rest bytes)
@@ -70,7 +105,9 @@ form."
     ;; truncated pointer: high byte with no low byte
     (signals error (read-name (make-reader (octets #xc0))))
     ;; label length runs past the end of the buffer
-    (signals error (read-name (make-reader (octets #x05 #x61 #x62))))))
+    (signals error (read-name (make-reader (octets #x05 #x61 #x62))))
+    ;; a label with no terminating root — reader runs off the end
+    (signals error (read-name (make-reader (octets #x01 #x61))))))
 
 (test dns-message-round-trips
   "Encode a query+answer message, decode it, and re-encode byte-for-byte."

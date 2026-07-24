@@ -50,6 +50,17 @@
     (is (typep d 'txt-record))
     (is (equal '("path=/ipp/print" "rp=ipp/print" "air=none") (txt-strings d)))))
 
+(test unknown-record-round-trips
+  ;; An unmodeled rrtype decodes to UNKNOWN-RECORD with its raw rdata intact.
+  (let* ((rdata (make-array 3 :element-type '(unsigned-byte 8)
+                             :initial-contents '(1 2 3)))
+         (d (round-trip-record
+             (make-instance 'unknown-record :name "x.local" :rtype 99
+                                            :ttl 120 :rdata rdata))))
+    (is (typep d 'unknown-record))
+    (is (= 99 (rr-type d)))
+    (is (equalp rdata (rr-rdata d)))))
+
 (test nsec-record-round-trips
   ;; A name that has A + SRV + TXT but not AAAA — the mDNS way to say
   ;; "don't bother asking for the IPv6 address".

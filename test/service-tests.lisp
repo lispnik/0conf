@@ -83,6 +83,16 @@
     ;; With no addresses there's only the instance NSEC, no host NSEC.
     (is (= 1 (length none-nsecs)))))
 
+(test service-info-reassembles-ipv6-address
+  ;; Exercises the AAAA arm of address reassembly.
+  (let* ((v6 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                  :port 1 :addresses (list v6)))
+         (instance (service-instance-name info))
+         (rebuilt (service-info-from-records "_x._tcp.local" instance
+                                             (service-info-records info))))
+    (is (equalp v6 (first (service-info-addresses rebuilt))))))
+
 (test service-info-reassembles-from-its-own-records
   ;; Round-trip: expand a service to records, then rebuild it from them.
   (let* ((original (sample-service))

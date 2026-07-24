@@ -13,11 +13,11 @@
                (:file "octets")       ; wire codec: byte cursor + name compression
                (:file "records")      ; CLOS resource records + rdata codecs
                (:file "message")      ; DNS header + sections
-               (:file "cache")        ; TODO: TTL cache
-               (:file "transport")    ; TODO: SBCL multicast UDP socket
-               (:file "service-info") ; TODO: DNS-SD register side
-               (:file "responder")    ; TODO: probing/announcing/conflict engine
-               (:file "browser")      ; TODO: DNS-SD discovery side
+               (:file "cache")        ; TTL cache + cache-flush semantics
+               (:file "transport")    ; SBCL multicast UDP socket (v4 + v6)
+               (:file "service-info") ; DNS-SD service expansion / reassembly
+               (:file "responder")    ; probing, conflict resolution, announce
+               (:file "browser")      ; DNS-SD discovery (snapshot + live)
                (:file "0conf"))       ; public start/stop API
   :in-order-to ((test-op (test-op "0conf/test"))))
 
