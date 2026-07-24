@@ -7,7 +7,8 @@
 
 (defun run-tests ()
   "Entry point used by (asdf:test-system :0conf).  Signals on failure."
-  (let ((0conf::*response-delay* nil))     ; no artificial sleeps under test
+  (let ((0conf::*response-delay* nil)      ; no artificial sleeps under test
+        (0conf::*announce-interval* 0))
     (unless (run! '0conf-tests)
       (error "0conf test suite failed."))))
 

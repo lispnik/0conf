@@ -457,6 +457,9 @@ retry until the name is free (RFC 6762 §8/§9).  Returns INFO."
         (progn (sleep *probe-conflict-backoff*) (funcall rename-fn info))
         (return info))))
 
+(defparameter *announce-interval* 1.0
+  "Seconds between the two announcements (RFC 6762 §8.3).  Bound to 0 in tests.")
+
 (defun announce (responder records)
   "Unsolicited responses so listeners learn the records immediately.
 RFC 6762 §8.3 asks for at least two, at least 1s apart."
@@ -464,7 +467,7 @@ RFC 6762 §8.3 asks for at least two, at least 1s apart."
                   (make-dns-message :flags +flag-response+ :answers records))))
     (dotimes (i 2)
       (broadcast responder message)
-      (sleep 1))))
+      (sleep *announce-interval*))))
 
 (defun register-service (responder info &key (probe t))
   "Advertise INFO.  Probes the instance name AND the host name (renaming each on
@@ -487,6 +490,25 @@ conflict, RFC 6762 §8/§9), then announces its record set.  Records are built
       (setf (responder-records responder)
             (append records (responder-records responder))))
     (announce responder records)
+    info))
+
+(defun update-service-txt (responder info new-txt)
+  "Change a registered service's TXT to NEW-TXT (an alist) and re-announce the new
+record (RFC 6762 §8.4): the cache-flush TXT supersedes the old one in listeners'
+caches.  INFO must already be registered."
+  (setf (service-info-txt info) new-txt)
+  (let ((record (make-instance 'txt-record
+                               :name (service-instance-name info)
+                               :cache-flush t :ttl *default-other-ttl*
+                               :strings (txt-alist->strings new-txt))))
+    (bordeaux-threads:with-lock-held ((responder-lock responder))
+      (setf (responder-records responder)
+            (cons record
+                  (remove-if (lambda (r)
+                               (and (typep r 'txt-record)
+                                    (string-equal (rr-name r) (service-instance-name info))))
+                             (responder-records responder)))))
+    (announce responder (list record))
     info))
 
 (defun send-goodbye (responder info)

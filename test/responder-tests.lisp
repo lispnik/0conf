@@ -61,6 +61,19 @@ trip the conflict flag here (simultaneous-prober tiebreak is a separate TODO)."
     (0conf::handle-packet r (a-response-for "Printer._ipp._tcp.local") "10.0.0.1" 5353)
     (is (not (0conf::responder-conflict r)))))
 
+(test update-service-txt-replaces-record
+  "update-service-txt swaps the instance's TXT record and mutates the info."
+  (let* ((responder (make-responder))
+         (info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                  :port 1 :txt '(("v" . "1")))))
+    (setf (0conf::responder-records responder) (service-info-records info))
+    (update-service-txt responder info '(("v" . "2")))
+    (let ((txts (remove-if-not (lambda (r) (typep r 'txt-record))
+                               (0conf::responder-records responder))))
+      (is (= 1 (length txts)))                        ; still exactly one TXT record
+      (is (member "v=2" (txt-strings (first txts)) :test #'string=))
+      (is (equal '(("v" . "2")) (service-info-txt info))))))
+
 (test next-host-name-bumps
   "RFC 6762 §9 host renaming: append/increment a \"-N\" suffix on the first label."
   (is (string= "myhost-2.local"  (0conf::next-host-name "myhost.local")))

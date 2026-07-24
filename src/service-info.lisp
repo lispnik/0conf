@@ -12,10 +12,17 @@
 (defparameter *default-other-ttl* 4500)   ; PTR / TXT
 (defparameter *default-host-ttl*  120)     ; SRV / A / AAAA
 
+(defun default-host-name ()
+  "This machine's mDNS host name, e.g. \"myhost.local\" — the first label of the
+system host name with a `.local` domain."
+  (let* ((raw (machine-instance))
+         (short (subseq raw 0 (or (position #\. raw) (length raw)))))
+    (format nil "~A.local" short)))
+
 (defstruct (service-info (:constructor make-service-info))
-  (type "" :type string)          ; e.g. "_ipp._tcp.local"
-  (name "" :type string)          ; instance label, e.g. "My Printer"
-  (host "" :type string)          ; e.g. "myhost.local"
+  (type "" :type string)               ; e.g. "_ipp._tcp.local"
+  (name "" :type string)               ; instance label, e.g. "My Printer"
+  (host (default-host-name) :type string) ; defaults to this machine's .local name
   (port 0  :type (unsigned-byte 16))
   (addresses '())                 ; list of 4- or 16-octet vectors
   (txt '())                       ; alist (key . value); value NIL = keyless, string, or octets

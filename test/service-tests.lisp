@@ -83,6 +83,21 @@
     ;; With no addresses there's only the instance NSEC, no host NSEC.
     (is (= 1 (length none-nsecs)))))
 
+(test service-info-defaults-host-to-local-machine
+  (let ((info (make-service-info :type "_x._tcp.local" :name "N" :port 1)))
+    (is (string= (default-host-name) (service-info-host info)))
+    (is (search ".local" (service-info-host info)))
+    ;; an explicit :host still wins
+    (is (string= "custom.local"
+                 (service-info-host (make-service-info :type "_x._tcp.local" :name "N"
+                                                       :host "custom.local" :port 1))))))
+
+(test instance-type-derivation
+  (is (string= "_ipp._tcp.local" (0conf::instance-type "My Printer._ipp._tcp.local")))
+  ;; a dotted instance label must not confuse the type derivation
+  (is (string= "_ipp._tcp.local"
+               (0conf::instance-type "My Printer 2\\.0._ipp._tcp.local"))))
+
 (test service-instance-name-escapes-dots
   (let ((info (make-service-info :type "_ipp._tcp.local" :name "My Printer 2.0"
                                  :host "h.local" :port 631)))

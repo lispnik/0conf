@@ -29,6 +29,9 @@ SBCL only (the multicast transport uses `sb-bsd-sockets` + `sb-alien`).
 ;; One-shot snapshot — discover printers on the LAN for 3s:
 (0conf:browse-once "_ipp._tcp.local" :timeout 3.0)
 
+;; Resolve one known instance to a service-info (host/port/txt/addresses):
+(0conf:resolve "Front Desk Printer._ipp._tcp.local")
+
 ;; Live browsing — callbacks as services come and go (needs a running responder):
 (let* ((r (0conf:start-responder (0conf:make-responder)))
        (b (0conf:browse-services r "_ipp._tcp.local"
@@ -38,13 +41,14 @@ SBCL only (the multicast transport uses `sb-bsd-sockets` + `sb-alien`).
   (0conf:stop-browse b)
   (0conf:stop r))
 
-;; Advertise a service:
-(let ((r (0conf:start
-          :services (list (0conf:make-service-info
-                           :type "_http._tcp.local" :name "My Widget"
-                           :host "widget.local" :port 8080
-                           :addresses (list (0conf:parse-ipv4 "192.168.1.42"))
-                           :txt '(("path" . "/status")))))))
+;; Advertise a service (:host defaults to this machine's .local name):
+(let* ((info (0conf:make-service-info
+              :type "_http._tcp.local" :name "My Widget" :port 8080
+              :addresses (list (0conf:parse-ipv4 "192.168.1.42"))
+              :txt '(("path" . "/status"))))
+       (r (0conf:start :services (list info))))
+  ;; update the TXT later without re-registering:
+  (0conf:update-service-txt r info '(("path" . "/status") ("load" . "0.4")))
   ;; ... later ...
   (0conf:stop r))
 ```

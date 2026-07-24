@@ -41,7 +41,7 @@
    #:service-info-addresses #:service-info-txt #:service-info-subtypes
    #:service-info-priority #:service-info-weight
    #:service-instance-name #:service-info-records #:service-info-from-records
-   #:txt-alist->strings #:txt-strings->alist
+   #:txt-alist->strings #:txt-strings->alist #:default-host-name
    ;; transport
    #:mdns-socket #:make-mdns-socket #:mdns-send #:mdns-recv #:mdns-recv-timeout
    #:close-mdns-socket
@@ -49,7 +49,7 @@
    #:net-interface-ipv4 #:net-interface-has-v6
    ;; responder / browser / public API
    #:responder #:make-responder #:start-responder #:stop-responder
-   #:register-service #:unregister-service
-   #:browse #:browse-once
+   #:register-service #:unregister-service #:update-service-txt
+   #:browse #:browse-once #:resolve
    #:service-browser #:browse-services #:stop-browse
    #:start #:stop))

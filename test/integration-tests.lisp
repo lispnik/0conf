@@ -139,3 +139,29 @@ multicast (the outgoing query fails harmlessly and is ignored)."
           (close-mdns-socket browser-sock)
           (close-mdns-socket sender)))
     (error (e) (skip "loopback browse-once unavailable: ~A" e))))
+
+(test resolve-single-instance-over-loopback
+  "resolve queries one instance name and assembles the SERVICE-INFO from the
+response delivered to its socket."
+  (handler-case
+      (let* ((sock (ephemeral-socket))
+             (sender (ephemeral-socket))
+             (info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                      :port 42 :addresses (list (parse-ipv4 "127.0.0.1"))))
+             (instance (service-instance-name info))
+             (response (encode-message
+                        (make-dns-message :flags +flag-response+
+                                          :answers (service-info-records info)))))
+        (unwind-protect
+             (progn
+               (mdns-send sender response :host "127.0.0.1" :port (local-port sock))
+               (sleep 0.1)
+               (let ((resolved (resolve instance :timeout 0.5 :socket sock)))
+                 (is (not (null resolved)))
+                 (is (= 42 (service-info-port resolved)))
+                 (is (string= "h.local" (service-info-host resolved)))
+                 (is (equalp (parse-ipv4 "127.0.0.1")
+                             (first (service-info-addresses resolved))))))
+          (close-mdns-socket sock)
+          (close-mdns-socket sender)))
+    (error (e) (skip "loopback resolve unavailable: ~A" e))))

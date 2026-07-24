@@ -58,6 +58,45 @@ SOCKET, if given, is used instead of opening one (and is left open) — for test
            (assemble-services cache type))
       (when own-socket (close-mdns-socket socket)))))
 
+(defun instance-type (instance)
+  "The service type of a fully-qualified INSTANCE name — everything after the
+first (instance) label.  \"My Printer._ipp._tcp.local\" -> \"_ipp._tcp.local\"."
+  (format nil "~{~A~^.~}" (mapcar #'escape-label (rest (split-name instance)))))
+
+(defun resolve (instance &key (timeout 2.0) interface socket)
+  "Resolve one fully-qualified service instance name (e.g.
+\"My Printer._ipp._tcp.local\") to a single SERVICE-INFO, or NIL if not found
+within TIMEOUT.  SOCKET, if given, is used instead of opening one (for tests)."
+  (let* ((own-socket (null socket))
+         (socket (or socket (make-mdns-socket :interface interface)))
+         (cache (make-cache))
+         (type (instance-type instance)))
+    (unwind-protect
+         (progn
+           (ignore-errors
+             (mdns-send socket
+                        (encode-message
+                         (make-dns-message
+                          :questions (list (make-question :name instance
+                                                          :qtype +type-any+))))))
+           (let ((deadline (+ (get-internal-real-time)
+                              (round (* timeout internal-time-units-per-second)))))
+             (loop for remaining = (/ (- deadline (get-internal-real-time))
+                                      internal-time-units-per-second)
+                   while (plusp remaining)
+                   do (let ((octets (mdns-recv-timeout socket (float remaining 1.0))))
+                        (when octets
+                          (let ((message (decode-message octets)))
+                            (dolist (r (append (dns-message-answers message)
+                                               (dns-message-additionals message)))
+                              (cache-add cache r)))))))
+           (service-info-from-records
+            type instance
+            (append (cache-get cache instance +type-srv+)
+                    (cache-get cache instance +type-txt+)
+                    (all-address-records cache instance))))
+      (when own-socket (close-mdns-socket socket)))))
+
 (defun browse (type callback &key (timeout 2.0) interface)
   "Browse for TYPE on a background thread, calling (funcall CALLBACK service-info)
 for each instance found.  Returns the thread."
