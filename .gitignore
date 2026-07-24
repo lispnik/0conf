@@ -7,3 +7,6 @@
 
 # Tangled from doc/tutorial.org (the .org is the source of truth)
 /doc/tutorial.lisp
+
+# Generated sb-cover report
+/coverage/

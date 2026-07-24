@@ -62,6 +62,21 @@ sbcl --non-interactive --load doc/tutorial.lisp     # 15 checks, all self-assert
 
 CI tangles and runs it on every push, so the tutorial can't drift from working code.
 
+## Coverage
+
+CI generates an [`sb-cover`](http://www.sbcl.org/manual/#sb_002dcover) report each
+run: a per-file table is posted to the run summary and the full HTML is uploaded
+as the `coverage-html` artifact. Reproduce locally:
+
+```sh
+sbcl --non-interactive --load scripts/coverage.lisp   # writes coverage/cover-index.html
+python3 scripts/coverage-summary.py                   # prints the summary table
+```
+
+The library sources sit around ~70% of expressions; the untested remainder is
+mostly the multicast send/receive paths (no live network in CI) and pure
+declaration files.
+
 ## Develop
 
 Dependencies are managed with [ocicl](https://github.com/ocicl/ocicl):

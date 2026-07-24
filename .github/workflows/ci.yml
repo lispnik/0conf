@@ -61,3 +61,17 @@ jobs:
           emacs --batch --eval "(require 'org)" \
                 --eval '(org-babel-tangle-file "doc/tutorial.org")'
           sbcl --non-interactive --load doc/tutorial.lisp
+
+      - name: Test coverage report (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sbcl --non-interactive --load scripts/coverage.lisp
+          python3 scripts/coverage-summary.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage HTML
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage/
+          if-no-files-found: error
