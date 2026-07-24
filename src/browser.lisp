@@ -26,19 +26,24 @@
           for info = (service-info-from-records type instance records)
           when info collect info)))
 
-(defun browse-once (type &key (timeout 2.0) interface)
+(defun browse-once (type &key (timeout 2.0) interface socket)
   "Query for service TYPE (e.g. \"_ipp._tcp.local\"), collect responses for
 TIMEOUT seconds, and return a list of SERVICE-INFO.  INTERFACE (a dotted IPv4
-string) picks the multicast egress interface — needed on VPN/multi-homed hosts."
-  (let ((socket (make-mdns-socket :interface interface))
-        (cache (make-cache)))
+string) picks the multicast egress interface — needed on VPN/multi-homed hosts.
+SOCKET, if given, is used instead of opening one (and is left open) — for tests."
+  (let* ((own-socket (null socket))
+         (socket (or socket (make-mdns-socket :interface interface)))
+         (cache (make-cache)))
     (unwind-protect
          (progn
-           (mdns-send socket
-                      (encode-message
-                       (make-dns-message
-                        :questions (list (make-question :name type
-                                                        :qtype +type-ptr+)))))
+           ;; A send failure on one interface (e.g. EHOSTUNREACH on a VPN link)
+           ;; must not abort collection.
+           (ignore-errors
+             (mdns-send socket
+                        (encode-message
+                         (make-dns-message
+                          :questions (list (make-question :name type
+                                                          :qtype +type-ptr+))))))
            (let ((deadline (+ (get-internal-real-time)
                               (round (* timeout internal-time-units-per-second)))))
              (loop for remaining = (/ (- deadline (get-internal-real-time))
@@ -51,7 +56,7 @@ string) picks the multicast egress interface — needed on VPN/multi-homed hosts
                                                (dns-message-additionals message)))
                               (cache-add cache r)))))))
            (assemble-services cache type))
-      (close-mdns-socket socket))))
+      (when own-socket (close-mdns-socket socket)))))
 
 (defun browse (type callback &key (timeout 2.0) interface)
   "Browse for TYPE on a background thread, calling (funcall CALLBACK service-info)

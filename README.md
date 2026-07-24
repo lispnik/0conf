@@ -73,8 +73,8 @@ sbcl --non-interactive --load scripts/coverage.lisp   # writes coverage/cover-in
 python3 scripts/coverage-summary.py                   # prints the summary table
 ```
 
-The library sources sit around ~70% of expressions; the untested remainder is
-mostly the multicast send/receive paths (no live network in CI) and pure
+The library sources sit around ~84% of expressions; the untested remainder is
+mostly the live multicast send/join paths (no multicast fabric in CI) and pure
 declaration files.
 
 ## Develop

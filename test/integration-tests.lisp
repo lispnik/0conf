@@ -114,3 +114,28 @@ with the query id echoed, the question repeated, and TTLs capped at 10s
           (stop-responder responder)
           (close-mdns-socket client)))
     (error (e) (skip "loopback legacy test unavailable: ~A" e))))
+
+(test browse-once-collects-and-assembles-over-loopback
+  "browse-once with an injected socket collects a response delivered to it and
+reassembles the service — exercising the receive loop and assembly with no
+multicast (the outgoing query fails harmlessly and is ignored)."
+  (handler-case
+      (let* ((browser-sock (ephemeral-socket))
+             (sender (ephemeral-socket))
+             (info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                      :port 1 :addresses (list (parse-ipv4 "127.0.0.1"))))
+             (response (encode-message
+                        (make-dns-message :flags +flag-response+
+                                          :answers (service-info-records info)))))
+        (unwind-protect
+             (progn
+               ;; Pre-queue the response in the browser socket's receive buffer.
+               (mdns-send sender response :host "127.0.0.1" :port (local-port browser-sock))
+               (sleep 0.1)
+               (let ((found (browse-once "_x._tcp.local" :timeout 0.5 :socket browser-sock)))
+                 (is (= 1 (length found)))
+                 (is (string= "N" (service-info-name (first found))))
+                 (is (= 1 (service-info-port (first found))))))
+          (close-mdns-socket browser-sock)
+          (close-mdns-socket sender)))
+    (error (e) (skip "loopback browse-once unavailable: ~A" e))))
