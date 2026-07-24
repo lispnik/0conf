@@ -114,10 +114,15 @@ OS forbids binding 5353.
   v4 and (best-effort) v6 listener, and answers on the socket a query arrived on.
   `mdns-send`/`mdns-recv` are family-aware and `parse-ipv6`/`format-ipv6` handle
   `::` compression. (`parse-ipv6` doesn't yet handle embedded-IPv4 forms.)
-- **Character set:** all text is UTF-8 (RFC 6762 §16 / RFC 6763). Names are
-  normalized to Unicode NFC on encode via SBCL's built-in `sb-unicode` — so
-  composed and decomposed spellings of an accented name go on the wire
-  identically — with no external dependency.
+- **Character set & names:** all text is UTF-8 (RFC 6762 §16 / RFC 6763), with
+  names normalized to Unicode NFC — on encode *and* decode — via SBCL's built-in
+  `sb-unicode` (no external dependency). Names use RFC 4343 presentation escaping,
+  so a DNS-SD instance label containing a dot (`My Printer 2.0`) round-trips
+  correctly. IPv6 parsing handles `::` compression and embedded-IPv4
+  (`::ffff:1.2.3.4`).
+- **DNS-SD extras:** service subtypes (`_printer._sub._http._tcp.local`) via a
+  `:subtypes` list, and binary TXT values — a TXT value may be an octet vector,
+  round-tripping as bytes rather than being forced through UTF-8.
 - **Negative responses:** `service-info-records` emits NSEC records (instance
   name → SRV+TXT, host name → the address families present), and the responder
   also attaches them on demand (RFC 6762 §6.1): a positive answer carries the
@@ -148,6 +153,5 @@ OS forbids binding 5353.
   from the cache on a short poll and diffed. A background sweeper expires stale
   cache entries so removals happen on time. Cross-thread cache access is guarded
   by the responder lock.
-- **Remaining TODOs:** embedded-IPv4 IPv6 literals (`::ffff:1.2.3.4`), DNS-SD
-  instance-name escaping, subtypes, binary TXT values, and inbound NFC
-  normalization.
+- **Remaining TODOs:** full per-interface multicast on multi-homed hosts (the
+  responder currently opens one socket per family bound to all interfaces).

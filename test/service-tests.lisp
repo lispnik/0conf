@@ -83,6 +83,44 @@
     ;; With no addresses there's only the instance NSEC, no host NSEC.
     (is (= 1 (length none-nsecs)))))
 
+(test service-instance-name-escapes-dots
+  (let ((info (make-service-info :type "_ipp._tcp.local" :name "My Printer 2.0"
+                                 :host "h.local" :port 631)))
+    (is (string= "My Printer 2\\.0._ipp._tcp.local" (service-instance-name info)))))
+
+(test dotted-instance-name-round-trips-through-records
+  ;; A dotted instance label survives expansion, the wire, and reassembly.
+  (let* ((info (make-service-info :type "_ipp._tcp.local" :name "My Printer 2.0"
+                                  :host "h.local" :port 631
+                                  :addresses (list (parse-ipv4 "10.0.0.1"))))
+         (decoded (dns-message-answers
+                   (decode-message (encode-message
+                                    (make-dns-message :answers (service-info-records info))))))
+         (srv (find-if (lambda (r) (typep r 'srv-record)) decoded))
+         (rebuilt (service-info-from-records "_ipp._tcp.local" (rr-name srv) decoded)))
+    (is (string= "My Printer 2\\.0._ipp._tcp.local" (rr-name srv)))
+    (is (string= "My Printer 2.0" (service-info-name rebuilt)))
+    (is (= 631 (service-info-port rebuilt)))))
+
+(test service-info-emits-subtype-ptrs
+  (let* ((info (make-service-info :type "_ipp._tcp.local" :name "P" :host "h.local"
+                                  :port 631 :subtypes '("_color" "_duplex")))
+         (subptrs (remove-if-not (lambda (r) (and (typep r 'ptr-record)
+                                                  (search "._sub." (rr-name r))))
+                                 (service-info-records info))))
+    (is (= 2 (length subptrs)))
+    (is (find "_color._sub._ipp._tcp.local" subptrs :key #'rr-name :test #'string=))
+    (is (string= (service-instance-name info) (ptr-target (first subptrs))))))
+
+(test service-info-binary-txt-round-trips
+  (let* ((binary (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 255)))
+         (info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                  :port 1 :txt (list (cons "bin" binary))))
+         (rebuilt (service-info-from-records "_x._tcp.local"
+                                             (service-instance-name info)
+                                             (service-info-records info))))
+    (is (equalp binary (cdr (assoc "bin" (service-info-txt rebuilt) :test #'string=))))))
+
 (test service-info-reassembles-ipv6-address
   ;; Exercises the AAAA arm of address reassembly.
   (let* ((v6 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))

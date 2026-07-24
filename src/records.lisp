@@ -74,10 +74,13 @@
   (:default-initargs :rtype +type-txt+))
 
 (defmethod write-rdata ((r txt-record) w)
-  ;; DNS-SD: an empty TXT record must still carry a single empty string.
+  ;; DNS-SD: an empty TXT record must still carry a single empty string.  Each
+  ;; entry is a string (UTF-8 encoded) or a raw octet vector (a binary value).
   (let ((strings (or (txt-strings r) '(""))))
     (dolist (s strings)
-      (let ((octets (string->octets s)))
+      (let ((octets (etypecase s
+                      (string (string->octets s))
+                      ((vector (unsigned-byte 8)) s))))
         (assert (<= (length octets) 255) () "TXT character-string too long: ~S" s)
         (write-u8 w (length octets))
         (write-octets w octets)))))
@@ -188,9 +191,13 @@
         (t (rec unknown-record :rtype rtype :rdata (read-octets reader rdlength)))))))
 
 (defun read-txt-strings (reader end)
+  ;; Decode each character-string as UTF-8, falling back to the raw octet vector
+  ;; when the bytes aren't valid UTF-8 (a binary TXT value).
   (loop while (< (reader-pos reader) end)
         for len = (read-u8 reader)
-        collect (octets->string (read-octets reader len))))
+        for bytes = (read-octets reader len)
+        collect (handler-case (octets->string bytes)
+                  (error () bytes))))
 
 (defun clone-record (record &key (ttl (rr-ttl record)))
   "A shallow copy of RECORD, optionally with a different TTL.  Used for legacy

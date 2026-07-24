@@ -18,30 +18,43 @@
   (host "" :type string)          ; e.g. "myhost.local"
   (port 0  :type (unsigned-byte 16))
   (addresses '())                 ; list of 4- or 16-octet vectors
-  (txt '())                       ; alist (key . value-string); value NIL = keyless
+  (txt '())                       ; alist (key . value); value NIL = keyless, string, or octets
+  (subtypes '())                  ; list of subtype labels, e.g. ("_printer")
   (priority 0)
   (weight 0))
 
 (defun service-instance-name (info)
-  "\"My Printer._ipp._tcp.local\" — the fully-qualified instance name."
-  (format nil "~A.~A" (service-info-name info) (service-info-type info)))
+  "\"My Printer._ipp._tcp.local\" — the fully-qualified instance name.  The
+instance label is escaped (RFC 4343), so labels containing dots are safe."
+  (format nil "~A.~A" (escape-label (service-info-name info)) (service-info-type info)))
 
 (defun txt-alist->strings (alist)
-  "Turn ((\"path\" . \"/admin\") (\"paperless\")) into (\"path=/admin\" \"paperless\")."
+  "Turn TXT pairs into character-string entries.  A value may be a string
+(\"key=value\"), NIL (keyless \"key\"), or an octet vector (binary value, giving
+an octet-vector entry \"key=<bytes>\")."
   (mapcar (lambda (pair)
             (destructuring-bind (key . value) pair
-              (if value
-                  (format nil "~A=~A" key value)
-                  (format nil "~A" key))))
+              (cond
+                ((null value) (format nil "~A" key))
+                ((stringp value) (format nil "~A=~A" key value))
+                (t (concatenate '(vector (unsigned-byte 8))
+                                (string->octets (format nil "~A=" key))
+                                value)))))
           alist))
 
 (defun txt-strings->alist (strings)
-  "Inverse of TXT-ALIST->STRINGS: split each \"key=value\" on the first #\\=."
+  "Inverse of TXT-ALIST->STRINGS: split each entry on the first #\\=.  A binary
+(octet-vector) entry yields a string key and an octet-vector value."
   (mapcar (lambda (s)
-            (let ((eq (position #\= s)))
-              (if eq
-                  (cons (subseq s 0 eq) (subseq s (1+ eq)))
-                  (cons s nil))))
+            (etypecase s
+              (string
+               (let ((eq (position #\= s)))
+                 (if eq (cons (subseq s 0 eq) (subseq s (1+ eq))) (cons s nil))))
+              ((vector (unsigned-byte 8))
+               (let ((eq (position (char-code #\=) s)))
+                 (if eq
+                     (cons (octets->string (subseq s 0 eq)) (subseq s (1+ eq)))
+                     (cons (octets->string s) nil))))))
           strings))
 
 (defun address-record (name address ttl)
@@ -100,7 +113,14 @@ Order: PTR, SRV, TXT, then one A/AAAA per address."
                               :name (service-info-host info)
                               :next-name (service-info-host info)
                               :cache-flush t :ttl host-ttl
-                              :types atypes)))))))
+                              :types atypes))))
+     ;; Shared PTR per subtype: "_sub._type" -> instance (RFC 6763 §7.1).
+     (mapcar (lambda (subtype)
+               (make-instance 'ptr-record
+                              :name (format nil "~A._sub.~A"
+                                            subtype (service-info-type info))
+                              :target instance :ttl other-ttl))
+             (service-info-subtypes info)))))
 
 ;;; Reassembly (browser side): given the records seen for one instance, build a
 ;;; SERVICE-INFO.  Returns NIL if the essential SRV record is missing.
@@ -115,7 +135,8 @@ Order: PTR, SRV, TXT, then one A/AAAA per address."
       (let ((host (srv-target srv)))
         (make-service-info
          :type type
-         :name (subseq instance 0 (max 0 (- (length instance) (length type) 1)))
+         ;; The instance's first label, unescaped, is the service name.
+         :name (or (first (split-name instance)) "")
          :host host
          :port (srv-port srv)
          :priority (srv-priority srv)

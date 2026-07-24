@@ -66,18 +66,48 @@ unaffected.  Uses SBCL's built-in sb-unicode (no external dependency)."
 
 ;;; Domain-name encoding with compression.
 ;;;
-;;; NOTE: names are treated as dot-separated strings here.  That is correct for
-;;; hostnames and service types (`_ipp._tcp.local`); DNS-SD *instance* labels can
-;;; legally contain dots and need escaping — a later refinement (represent names
-;;; as label lists internally).  Flagged as TODO.
+;;; Names are dot-separated strings in the RFC 4343 presentation form: a literal
+;;; dot inside a label is escaped as "\." and a backslash as "\\".  This lets a
+;;; DNS-SD instance label legally contain dots (e.g. "My Printer 2.0") without
+;;; ambiguity.  SPLIT-NAME returns the *unescaped* labels; ESCAPE-LABEL produces
+;;; the presentation form.  (Labels are UTF-8 Unicode text, so the numeric "\DDD"
+;;; escape for arbitrary bytes is not needed.)
+
+(defun escape-label (label)
+  "Escape a raw label into RFC 4343 presentation form: `.` -> `\\.`, `\\` -> `\\\\`."
+  (if (or (find #\. label) (find #\\ label))
+      (with-output-to-string (s)
+        (loop for ch across label
+              do (when (or (char= ch #\.) (char= ch #\\)) (write-char #\\ s))
+                 (write-char ch s)))
+      label))
+
 (defun split-name (name)
-  (remove "" (uiop:split-string name :separator '(#\.)) :test #'string=))
+  "Split a presentation-form NAME into its raw (unescaped) labels, honoring
+backslash escaping and dropping empty (root/trailing) labels."
+  (let ((labels '())
+        (cur (make-string-output-stream))
+        (i 0)
+        (n (length name)))
+    (loop while (< i n)
+          for ch = (char name i)
+          do (cond
+               ((char= ch #\\)
+                (when (< (1+ i) n) (write-char (char name (1+ i)) cur))
+                (incf i 2))
+               ((char= ch #\.)
+                (push (get-output-stream-string cur) labels)
+                (setf cur (make-string-output-stream))
+                (incf i))
+               (t (write-char ch cur) (incf i))))
+    (push (get-output-stream-string cur) labels)
+    (remove "" (nreverse labels) :test #'string=)))
 
 (defun write-name (writer name)
-  ;; Normalize to NFC before encoding (RFC 6762 §16).  Compression suffixes are
-  ;; therefore compared in normalized form too, so it stays consistent.
+  ;; Normalize to NFC before encoding (RFC 6762 §16).  Compression suffixes use
+  ;; the escaped form as the key so distinct label sequences never collide.
   (loop for tail on (split-name (normalize-name name))
-        for suffix = (format nil "~{~A~^.~}" tail)
+        for suffix = (format nil "~{~A~^.~}" (mapcar #'escape-label tail))
         for seen = (gethash suffix (writer-labels writer))
         do (cond
              (seen
@@ -163,7 +193,10 @@ forward/self pointer or any read past the end of the message."
            (push (octets->string (subseq bytes pos (+ pos len))) labels)
            (incf pos len)))))
     (when jumped (setf (reader-pos reader) resume))
-    (format nil "~{~A~^.~}" (nreverse labels))))
+    ;; Escape dots/backslashes back into presentation form, and NFC-normalize the
+    ;; result so received names compare equal to our NFC-on-write names.
+    (normalize-name
+     (format nil "~{~A~^.~}" (mapcar #'escape-label (nreverse labels))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; IPv4 helpers
@@ -171,7 +204,8 @@ forward/self pointer or any read past the end of the message."
 
 (defun parse-ipv4 (string)
   "\"192.168.1.5\" -> #(192 168 1 5) as a simple octet vector."
-  (let ((parts (split-name string)))
+  ;; Plain dot-split (not SPLIT-NAME) — an IP address has no DNS escaping.
+  (let ((parts (uiop:split-string string :separator '(#\.))))
     (assert (= 4 (length parts)) () "Not a dotted-quad IPv4 address: ~S" string)
     (make-array 4 :element-type '(unsigned-byte 8)
                   :initial-contents (mapcar (lambda (p) (parse-integer p)) parts))))
@@ -186,8 +220,18 @@ forward/self pointer or any read past the end of the message."
 
 (defun parse-ipv6 (string)
   "Parse an IPv6 address (with optional \"::\" zero-compression) into a 16-octet
-simple vector.  E.g. \"ff02::fb\" -> #(#xff #x02 0 ... 0 #xfb).
-TODO: embedded-IPv4 forms like \"::ffff:1.2.3.4\" are not handled."
+simple vector.  E.g. \"ff02::fb\" -> #(#xff #x02 0 ... 0 #xfb).  Embedded-IPv4
+forms (\"::ffff:1.2.3.4\") are supported — the dotted-quad becomes the last 32 bits."
+  ;; Rewrite a trailing dotted-quad into two hex groups, then parse normally:
+  ;; "::ffff:1.2.3.4" -> "::ffff:0102:0304".
+  (let ((dot (position #\. string)))
+    (when dot
+      (let* ((colon (position #\: string :from-end t :end dot))
+             (v4 (parse-ipv4 (subseq string (1+ colon)))))
+        (setf string (format nil "~A~4,'0X:~4,'0X"
+                             (subseq string 0 (1+ colon))
+                             (logior (ash (aref v4 0) 8) (aref v4 1))
+                             (logior (ash (aref v4 2) 8) (aref v4 3)))))))
   (let ((out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
         (dbl (search "::" string)))
     (flet ((groups (s)

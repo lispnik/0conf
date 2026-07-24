@@ -50,6 +50,18 @@
     (is (typep d 'txt-record))
     (is (equal '("path=/ipp/print" "rp=ipp/print" "air=none") (txt-strings d)))))
 
+(test txt-record-binary-value-round-trips
+  ;; A binary (invalid-UTF-8) TXT entry survives as an octet vector; a text entry
+  ;; comes back as a string.
+  (let* ((binary (make-array 3 :element-type '(unsigned-byte 8)
+                              :initial-contents '(255 0 128)))
+         (d (round-trip-record
+             (make-instance 'txt-record :name "x.local"
+                                        :strings (list "k=v" binary)))))
+    (is (typep d 'txt-record))
+    (is (string= "k=v" (first (txt-strings d))))
+    (is (equalp binary (second (txt-strings d))))))
+
 (test unknown-record-round-trips
   ;; An unmodeled rrtype decodes to UNKNOWN-RECORD with its raw rdata intact.
   (let* ((rdata (make-array 3 :element-type '(unsigned-byte 8)

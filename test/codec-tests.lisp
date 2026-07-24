@@ -100,6 +100,40 @@ form."
     (is (= 1 (length (dns-message-additionals d))))
     (is (string= "h2.local" (rr-name (first (dns-message-additionals d)))))))
 
+(test label-escaping-round-trips
+  ;; RFC 4343 presentation form: dots and backslashes inside a label are escaped.
+  (is (string= "a\\.b" (0conf::escape-label "a.b")))
+  (is (string= "a\\\\b" (0conf::escape-label "a\\b")))
+  (is (string= "plain" (0conf::escape-label "plain")))
+  ;; split-name unescapes and splits only on unescaped dots
+  (is (equal '("a.b" "c") (0conf::split-name "a\\.b.c")))
+  (is (equal '("a\\b") (0conf::split-name "a\\\\b")))
+  (is (equal '("host" "local") (0conf::split-name "host.local"))))
+
+(test name-with-dotted-label-round-trips
+  ;; A label containing a literal dot survives the wire and comes back escaped.
+  (let* ((escaped "My Printer 2\\.0._ipp._tcp.local")
+         (w (make-writer)))
+    (write-name w escaped)
+    (is (string= escaped (read-name (make-reader (writer-result w)))))))
+
+(test parse-ipv6-embedded-ipv4
+  (flet ((v (&rest bytes)
+           (make-array 16 :element-type '(unsigned-byte 8) :initial-contents bytes)))
+    (is (equalp (v 0 0 0 0 0 0 0 0 0 0 #xff #xff 1 2 3 4) (parse-ipv6 "::ffff:1.2.3.4")))
+    (is (equalp (v 0 0 0 0 0 0 0 0 0 0 0 0 1 2 3 4) (parse-ipv6 "::1.2.3.4")))
+    (is (equalp (v 0 #x64 #xff #x9b 0 0 0 0 0 0 0 0 1 2 3 4)
+                (parse-ipv6 "64:ff9b::1.2.3.4")))))
+
+(test read-name-normalizes-to-nfc
+  ;; A wire name whose bytes are decomposed é decodes to the composed (NFC) form.
+  (let* ((decomposed (coerce (list #\e (code-char #x301)) 'string))
+         (label (0conf::string->octets decomposed))
+         (wire (concatenate '(vector (unsigned-byte 8))
+                            (vector (length label)) label (vector 0)))
+         (name (read-name (make-reader (coerce wire '(simple-array (unsigned-byte 8) (*)))))))
+    (is (string= (coerce (list (code-char #xe9)) 'string) name))))
+
 (test read-name-rejects-bad-pointers
   "Malformed compression pointers must signal, not loop forever."
   (flet ((octets (&rest bytes)

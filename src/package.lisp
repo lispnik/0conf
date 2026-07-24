@@ -38,7 +38,7 @@
    ;; service-info / DNS-SD
    #:service-info #:make-service-info
    #:service-info-type #:service-info-name #:service-info-host #:service-info-port
-   #:service-info-addresses #:service-info-txt
+   #:service-info-addresses #:service-info-txt #:service-info-subtypes
    #:service-info-priority #:service-info-weight
    #:service-instance-name #:service-info-records #:service-info-from-records
    #:txt-alist->strings #:txt-strings->alist
