@@ -99,6 +99,21 @@ Returns :ADDED, :UPDATED, or :REMOVED."
              (cache-table cache))
     (nreverse out)))
 
+(defun cache-needs-refresh-p (cache &optional (now (get-universal-time)))
+  "True once some live entry passes 80% of its lifetime — the cue to re-query so
+records we care about don't silently expire (RFC 6762 §5.2)."
+  (let ((needs nil))
+    (maphash (lambda (key entries)
+               (declare (ignore key))
+               (dolist (e entries)
+                 (let ((life (- (cache-entry-expires e) (cache-entry-added e))))
+                   (when (and (plusp life)
+                              (< now (cache-entry-expires e))                 ; still live
+                              (>= (- now (cache-entry-added e)) (* 4/5 life))) ; past 80%
+                     (setf needs t)))))
+             (cache-table cache))
+    needs))
+
 (defun cache-expire (cache &optional (now (get-universal-time)))
   "Drop expired entries.  Returns the number removed."
   (let ((removed 0))

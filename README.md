@@ -109,11 +109,11 @@ OS forbids binding 5353.
   codec follows [mafintosh/dns-packet](https://github.com/mafintosh/dns-packet);
   Apple's [mDNSResponder](https://github.com/apple-oss-distributions/mDNSResponder)
   and the RFCs are the correctness oracle.
-- **IPv6:** fully supported — `(make-mdns-socket :family :ipv6)` opens an
-  AF_INET6 socket joining `ff02::fb` via `IPV6_JOIN_GROUP`, `mdns-send`/`mdns-recv`
-  are family-aware, and `parse-ipv6`/`format-ipv6` handle `::` compression. The
-  codec/records/cache/DNS-SD layers were already address-family agnostic.
-  (`parse-ipv6` doesn't yet handle embedded-IPv4 `::ffff:1.2.3.4` forms.)
+- **IPv6 / dual-stack:** `make-mdns-socket :family :ipv6` opens an AF_INET6
+  socket joining `ff02::fb` via `IPV6_JOIN_GROUP`; `start-responder` runs both a
+  v4 and (best-effort) v6 listener, and answers on the socket a query arrived on.
+  `mdns-send`/`mdns-recv` are family-aware and `parse-ipv6`/`format-ipv6` handle
+  `::` compression. (`parse-ipv6` doesn't yet handle embedded-IPv4 forms.)
 - **Character set:** all text is UTF-8 (RFC 6762 §16 / RFC 6763). Names are
   normalized to Unicode NFC on encode via SBCL's built-in `sb-unicode` — so
   composed and decomposed spellings of an accented name go on the wire
@@ -123,9 +123,14 @@ OS forbids binding 5353.
   also attaches them on demand (RFC 6762 §6.1): a positive answer carries the
   name's NSEC in Additional, and a query for a type we don't hold at a name we
   own is answered with the NSEC as a negative response.
-- **Response timing & cache-flush:** multicast responses are delayed a random
-  20–120ms (§6); cache-flush eviction spares records received within the last
+- **Response timing & cache-flush:** answers to all of a query's questions are
+  aggregated into one response (§7.4); multicast responses are delayed a random
+  20–120ms (§6), extended when the query's TC bit signals more known-answers are
+  coming (§7.2); cache-flush eviction spares records received within the last
   second so multi-packet responses aren't self-destructive (§10.2).
+- **Legacy unicast queries (§6.7):** a query from a source port other than 5353
+  gets a unicast reply with the query id echoed, the question repeated, and TTLs
+  capped at 10s.
 - **Probing & conflicts:** the responder probes an instance name three times
   and renames (`Foo` → `Foo (2)`) then re-probes on collision (RFC 6762 §8.1,
   §9). Both cases are handled: a *response* means the name is already owned
@@ -134,9 +139,11 @@ OS forbids binding 5353.
   if our data loses.
 - **Live browsing:** `browse-services` attaches to a running responder and fires
   add/update/remove callbacks as instances appear, change, and vanish. Discovery
-  uses a backing-off PTR query (§5.2) with known-answer suppression; the current
-  set is recomputed from the cache on a short poll and diffed. A background
-  sweeper expires stale cache entries so removals happen on time. Cross-thread
-  cache access is guarded by the responder lock.
-- **Remaining TODOs:** embedded-IPv4 IPv6 literals (`::ffff:1.2.3.4`), TTL-refresh
-  queries at 80/85/90/95% of ttl for long-lived browses, and CI.
+  uses a backing-off PTR query (§5.2) with known-answer suppression, plus
+  TTL-refresh queries once a tracked record passes 80% of its lifetime so
+  long-watched services don't spuriously expire; the current set is recomputed
+  from the cache on a short poll and diffed. A background sweeper expires stale
+  cache entries so removals happen on time. Cross-thread cache access is guarded
+  by the responder lock.
+- **Remaining TODOs:** embedded-IPv4 IPv6 literals (`::ffff:1.2.3.4`), DNS-SD
+  instance-name escaping, subtypes, and active duplicate-response suppression.

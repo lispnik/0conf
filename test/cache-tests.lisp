@@ -53,6 +53,15 @@
     (cache-add c (a-rec "host.local" "10.0.0.1" :ttl 0) now)
     (is (null (live-a c "host.local" now)))))
 
+(test cache-refresh-threshold
+  ;; cache-needs-refresh-p fires once a live entry passes 80% of its lifetime.
+  (let ((c (make-cache)) (now 1000))
+    (cache-add c (a-rec "host.local" "10.0.0.1" :ttl 100) now)   ; expires at 1100
+    (is (not (0conf::cache-needs-refresh-p c now)))              ; 0% elapsed
+    (is (not (0conf::cache-needs-refresh-p c (+ now 79))))       ; 79%
+    (is (0conf::cache-needs-refresh-p c (+ now 80)))             ; 80% -> refresh
+    (is (not (0conf::cache-needs-refresh-p c (+ now 200))))))    ; expired -> nothing to refresh
+
 (test cache-expiry
   (let ((c (make-cache)) (now 1000))
     (cache-add c (a-rec "host.local" "10.0.0.1" :ttl 120) now)

@@ -61,6 +61,13 @@ form."
 (test format-ipv4-round-trips
   (is (string= "192.168.1.5" (format-ipv4 (parse-ipv4 "192.168.1.5")))))
 
+(test truncation-bit-parsed
+  ;; The TC bit (0x0200) survives a round trip and is read back.
+  (is (0conf::message-truncated-p
+       (decode-message (encode-message (make-dns-message :flags #x0200)))))
+  (is (not (0conf::message-truncated-p
+            (decode-message (encode-message (make-dns-message :flags 0)))))))
+
 (test malformed-address-input-signals
   (signals error (parse-ipv4 "1.2.3"))                    ; too few octets
   (signals error (parse-ipv6 "1:2:3"))                    ; too few groups

@@ -19,6 +19,11 @@
   (authorities '())
   (additionals '()))
 
+(defun message-truncated-p (message)
+  "The TC (truncation) bit — set by a querier whose known-answer list spills into
+follow-up packets (RFC 6762 §7.2)."
+  (logbitp 9 (dns-message-flags message)))
+
 (defun write-question (writer question)
   (write-name writer (question-name question))
   (write-u16 writer (question-qtype question))

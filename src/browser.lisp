@@ -142,10 +142,18 @@ that would only repeat them stay quiet (known-answer suppression)."
         (remhash name known)
         (fire (service-browser-on-remove browser) name)))))
 
+(defun browser-should-query-p (browser now next-query)
+  "Time to send a query?  Either the backoff timer is due, or a cached record has
+passed 80% of its lifetime and needs refreshing (RFC 6762 §5.2)."
+  (or (>= now next-query)
+      (let ((responder (service-browser-responder browser)))
+        (bordeaux-threads:with-lock-held ((responder-lock responder))
+          (cache-needs-refresh-p (responder-cache responder))))))
+
 (defun browser-loop (browser poll)
   (let ((next-query 0))
     (loop while (service-browser-running browser) do
-      (when (>= (get-internal-real-time) next-query)
+      (when (browser-should-query-p browser (get-internal-real-time) next-query)
         (ignore-errors (send-browse-query browser))
         (setf next-query (+ (get-internal-real-time)
                             (* (service-browser-query-interval browser)

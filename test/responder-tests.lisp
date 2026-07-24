@@ -144,6 +144,19 @@ A record in the Authority section."
       (is (typep (first answers) 'nsec-record))
       (is (not (member +type-aaaa+ (nsec-types (first answers))))))))
 
+(test build-response-aggregates-multiple-questions
+  "Answers to all of a query's questions are aggregated into one response (§7.4)."
+  (let* ((info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                  :port 1 :addresses (list (parse-ipv4 "10.0.0.1"))))
+         (r (responder-advertising info))
+         (q (make-dns-message
+             :questions (list (make-question :name "h.local" :qtype +type-a+)
+                              (make-question :name "N._x._tcp.local" :qtype +type-srv+)))))
+    (multiple-value-bind (answers additionals) (0conf::build-response r q)
+      (declare (ignore additionals))
+      (is (find-if (lambda (x) (typep x 'a-record)) answers))
+      (is (find-if (lambda (x) (typep x 'srv-record)) answers)))))
+
 (test nsec-not-negative-when-type-present
   "Dual-stack host queried for AAAA gives the real AAAA, not a negative NSEC."
   (let* ((v6 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 2))

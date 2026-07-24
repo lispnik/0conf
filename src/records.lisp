@@ -191,3 +191,14 @@
   (loop while (< (reader-pos reader) end)
         for len = (read-u8 reader)
         collect (octets->string (read-octets reader len))))
+
+(defun clone-record (record &key (ttl (rr-ttl record)))
+  "A shallow copy of RECORD, optionally with a different TTL.  Used for legacy
+unicast responses (which cap TTLs) so we never mutate our shared live records."
+  (let ((copy (allocate-instance (class-of record))))
+    (dolist (slot (sb-mop:class-slots (class-of record)))
+      (let ((name (sb-mop:slot-definition-name slot)))
+        (when (slot-boundp record name)
+          (setf (slot-value copy name) (slot-value record name)))))
+    (setf (rr-ttl copy) ttl)
+    copy))

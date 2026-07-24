@@ -80,3 +80,37 @@ Exercises the listener thread, HANDLE-PACKET, ANSWER-QUERY, and the socket I/O."
           (stop-responder responder)          ; also closes server-sock
           (close-mdns-socket client)))
     (error (e) (skip "loopback responder test unavailable: ~A" e))))
+
+(test responder-legacy-unicast-query
+  "A query from a non-5353 source port (a legacy resolver) gets a unicast reply
+with the query id echoed, the question repeated, and TTLs capped at 10s
+(RFC 6762 §6.7) — even without the QU bit set."
+  (handler-case
+      (let ((server-sock (ephemeral-socket))
+            (client (ephemeral-socket))
+            (responder (make-responder))
+            (info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                     :port 1 :addresses (list (parse-ipv4 "127.0.0.1")))))
+        (setf (0conf::responder-records responder) (service-info-records info))
+        (unwind-protect
+             (progn
+               (start-responder responder :socket server-sock)
+               (let ((query (encode-message
+                             (make-dns-message
+                              :id 777        ; must be echoed back
+                              :questions (list (make-question :name "h.local"
+                                                              :qtype +type-a+))))))
+                 (mdns-send client query :host "127.0.0.1" :port (local-port server-sock))
+                 (let ((octets (mdns-recv-timeout client 2.0)))
+                   (is (not (null octets)))
+                   (when octets
+                     (let* ((reply (decode-message octets))
+                            (a (find-if (lambda (r) (typep r 'a-record))
+                                        (dns-message-answers reply))))
+                       (is (= 777 (dns-message-id reply)))                  ; echoed id
+                       (is (plusp (length (dns-message-questions reply))))  ; question repeated
+                       (is (not (null a)))
+                       (is (<= (rr-ttl a) 10)))))))                         ; TTL capped
+          (stop-responder responder)
+          (close-mdns-socket client)))
+    (error (e) (skip "loopback legacy test unavailable: ~A" e))))

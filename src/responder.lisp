@@ -1,23 +1,23 @@
 ;;;; responder.lisp — the mDNS query/response engine (RFC 6762).
 ;;;;
-;;;; A RESPONDER owns the socket and a listener thread.  Incoming *responses*
-;;;; feed the cache; incoming *queries* are matched against the records we've
-;;;; been asked to advertise, and answered (with known-answer suppression).
-;;;; REGISTER-SERVICE probes the name, then announces it.
-;;;;
-;;;; Pragmatic scope for now: probing sends the queries but does not yet rename
-;;;; on conflict (flagged below); the response delay is fixed rather than the
-;;;; RFC's randomized 20-120ms.  The wire behaviour is otherwise conformant.
+;;;; A RESPONDER owns one or two sockets (IPv4 and, best-effort, IPv6), a
+;;;; listener thread per socket, and a cache-expiry sweeper.  Incoming
+;;;; *responses* feed the cache; incoming *queries* are matched against the
+;;;; records we advertise and answered — with known-answer suppression, on-demand
+;;;; NSEC, a randomized response delay, and legacy-unicast handling.
+;;;; REGISTER-SERVICE probes the name (renaming on conflict), then announces it.
 
 (in-package #:0conf)
 
 (defstruct (responder (:constructor make-responder))
-  socket
+  socket                                ; IPv4 socket
+  socket6                               ; IPv6 socket (may be NIL)
   (cache (make-cache))
   (services '())                        ; list of SERVICE-INFO we advertise
   (records '())                         ; flattened authoritative records
   (lock (bordeaux-threads:make-lock "0conf-responder"))
-  (thread nil)
+  (thread nil)                          ; v4 listener
+  (thread6 nil)                         ; v6 listener
   (sweeper nil)
   (running nil)
   ;; Conflict detection during probing: PROBING holds the instance name we are
@@ -30,36 +30,54 @@
 (defun response-p (message)
   (logbitp 15 (dns-message-flags message)))   ; QR bit
 
+(defun responder-sockets (responder)
+  "The live sockets (v4, and v6 if present)."
+  (remove nil (list (responder-socket responder) (responder-socket6 responder))))
+
+(defun broadcast (responder octets)
+  "Send OCTETS out every socket (each address family's multicast group)."
+  (dolist (socket (responder-sockets responder))
+    (ignore-errors (mdns-send socket octets))))
+
 ;;; --- listener --------------------------------------------------------------
 
 (defparameter *cache-sweep-interval* 1.0
   "Seconds between background cache-expiry sweeps.")
 
+(defparameter *listen-poll-interval* 1.0
+  "Max seconds a listener blocks per iteration before re-checking RUNNING.")
+
 (defun start-responder (responder &key socket)
-  "Open the mDNS socket (or use the provided SOCKET, for testing over loopback)
-and start the listener + sweeper threads."
+  "Open the mDNS socket(s) and start a listener per socket plus the sweeper.
+SOCKET, if given, is used as the sole (IPv4) socket for testing over loopback;
+otherwise a v4 socket is opened and a v6 socket is attempted best-effort."
   (setf (responder-socket responder) (or socket (make-mdns-socket))
-        (responder-running responder) t
-        (responder-thread responder)
-        (bordeaux-threads:make-thread (lambda () (responder-loop responder))
-                                      :name "0conf-responder")
-        (responder-sweeper responder)
+        (responder-socket6 responder) (unless socket
+                                        (ignore-errors (make-mdns-socket :family :ipv6)))
+        (responder-running responder) t)
+  (setf (responder-thread responder)
+        (bordeaux-threads:make-thread
+         (lambda () (responder-loop responder (responder-socket responder)))
+         :name "0conf-responder-v4"))
+  (when (responder-socket6 responder)
+    (setf (responder-thread6 responder)
+          (bordeaux-threads:make-thread
+           (lambda () (responder-loop responder (responder-socket6 responder)))
+           :name "0conf-responder-v6")))
+  (setf (responder-sweeper responder)
         (bordeaux-threads:make-thread (lambda () (sweeper-loop responder))
                                       :name "0conf-sweeper"))
   responder)
 
 (defun sweeper-loop (responder)
-  "Periodically drop expired cache entries so removals actually happen on time
-(and memory doesn't grow).  Wakes often enough that STOP-RESPONDER is prompt."
+  "Periodically drop expired cache entries so removals happen on time (and memory
+doesn't grow).  Wakes often enough that STOP-RESPONDER is prompt."
   (loop while (responder-running responder) do
     (sleep *cache-sweep-interval*)
     (bordeaux-threads:with-lock-held ((responder-lock responder))
       (ignore-errors (cache-expire (responder-cache responder))))))
 
-(defparameter *listen-poll-interval* 1.0
-  "Max seconds the listener blocks per iteration before re-checking RUNNING.")
-
-(defun responder-loop (responder)
+(defun responder-loop (responder socket)
   ;; Poll with a timeout rather than a plain blocking recv: on Linux, closing the
   ;; socket from STOP-RESPONDER does NOT wake a thread blocked in recvfrom, so a
   ;; blocking recv would hang shutdown.  A bounded wait lets the loop notice
@@ -67,8 +85,8 @@ and start the listener + sweeper threads."
   (loop while (responder-running responder) do
     (handler-case
         (multiple-value-bind (octets host port)
-            (mdns-recv-timeout (responder-socket responder) *listen-poll-interval*)
-          (when octets (handle-packet responder octets host port)))
+            (mdns-recv-timeout socket *listen-poll-interval*)
+          (when octets (handle-packet responder octets host port socket)))
       ;; A closed socket or a malformed packet must not kill the loop.
       (error () nil))))
 
@@ -79,16 +97,17 @@ and start the listener + sweeper threads."
                   (copy-list (responder-services responder))))
     (ignore-errors (send-goodbye responder info)))
   (setf (responder-running responder) nil)
-  (when (responder-socket responder)
-    (close-mdns-socket (responder-socket responder)))
-  (dolist (thread (list (responder-thread responder) (responder-sweeper responder)))
+  (dolist (socket (responder-sockets responder))
+    (close-mdns-socket socket))
+  (dolist (thread (list (responder-thread responder) (responder-thread6 responder)
+                        (responder-sweeper responder)))
     (when (and thread (bordeaux-threads:thread-alive-p thread))
       (ignore-errors (bordeaux-threads:join-thread thread))))
   responder)
 
 ;;; --- inbound ---------------------------------------------------------------
 
-(defun handle-packet (responder octets host port)
+(defun handle-packet (responder octets host port &optional (socket (responder-socket responder)))
   (let ((message (decode-message octets)))
     (if (response-p message)
         (let ((records (append (dns-message-answers message)
@@ -98,7 +117,7 @@ and start the listener + sweeper threads."
           (detect-conflict responder records))
         (progn
           (tiebreak-probe responder message)
-          (answer-query responder message host port)))))
+          (answer-query responder message host port socket)))))
 
 (defun detect-conflict (responder records)
   "A *response* answering for the name we're probing means someone already owns
@@ -166,6 +185,8 @@ conflict."
                        (eq :lose (compare-record-sets ours theirs)))
               (setf (responder-conflict responder) t))))))))
 
+;;; --- building a response ---------------------------------------------------
+
 (defun record-answers-question-p (record question)
   (and (string-equal (rr-name record) (question-name question))
        (or (= (question-qtype question) +type-any+)
@@ -203,8 +224,9 @@ thread while REGISTER/UNREGISTER-SERVICE mutate the list."
 
 (defun build-response (responder message)
   "Compute the response to MESSAGE against our records, as
-(values answers additionals).  Pure apart from a locked snapshot of the record
-list, so it is unit-testable.
+(values answers additionals).  Answers to *all* the query's questions are
+aggregated into one response (RFC 6762 §7.4).  Pure apart from a locked snapshot
+of the record list, so it is unit-testable.
 
 Includes on-demand NSEC (RFC 6762 §6.1): a positive answer carries our NSEC for
 that name in Additional so the querier learns the full type set; a specific-type
@@ -233,22 +255,47 @@ negative response."
                (pushnew nsec answers)))))))
     (values (nreverse answers) (nreverse additionals))))
 
-(defun answer-query (responder message host port)
+(defun legacy-query-p (port)
+  "A query from a source port other than 5353 is a one-shot legacy resolver
+(RFC 6762 §6.7): reply unicast, echo the id, repeat the question, cap TTLs."
+  (/= port +mdns-port+))
+
+(defparameter *legacy-max-ttl* 10
+  "Cap (seconds) on TTLs in legacy unicast responses (RFC 6762 §6.7).")
+
+(defun make-response-message (query answers additionals legacy)
+  (flet ((cap (records)
+           (if legacy
+               (mapcar (lambda (r) (clone-record r :ttl (min (rr-ttl r) *legacy-max-ttl*)))
+                       records)
+               records)))
+    (make-dns-message
+     :id (if legacy (dns-message-id query) 0)
+     :flags +flag-response+
+     :questions (if legacy (dns-message-questions query) '())
+     :answers (cap answers)
+     :additionals (cap additionals))))
+
+(defun answer-query (responder message host port &optional (socket (responder-socket responder)))
   (multiple-value-bind (answers additionals) (build-response responder message)
     (when (or answers additionals)
       (let* ((questions (dns-message-questions message))
-             (unicast (and questions
-                           (question-unicast-response (first questions))))
+             (legacy (legacy-query-p port))
+             (unicast (or legacy
+                          (and questions
+                               (question-unicast-response (first questions)))))
              (reply (encode-message
-                     (make-dns-message :flags +flag-response+
-                                       :answers answers
-                                       :additionals additionals))))
+                     (make-response-message message answers additionals legacy))))
         (cond
           (unicast
-           (mdns-send (responder-socket responder) reply :host host :port port))
+           (mdns-send socket reply :host host :port port))
           (t
-           (when *response-delay* (sleep (+ 0.02 (random 0.1))))
-           (mdns-send (responder-socket responder) reply)))))))
+           (when *response-delay*
+             ;; A truncated query means more known-answers are coming; wait a bit
+             ;; longer to collect them before answering (RFC 6762 §7.2).
+             (sleep (+ 0.02 (random 0.1)
+                       (if (message-truncated-p message) 0.4 0.0))))
+           (mdns-send socket reply)))))))
 
 ;;; --- outbound: register / announce / goodbye -------------------------------
 
@@ -271,17 +318,20 @@ negative response."
 (defun send-probe (responder name info)
   "One probe: a unicast-response query for NAME with our proposed records in the
 Authority section (for tiebreaking), per RFC 6762 §8.1."
-  (mdns-send (responder-socket responder)
+  (broadcast responder
              (encode-message
               (make-dns-message
                :questions (list (make-question :name name :qtype +type-any+
                                                :unicast-response t))
                :authorities (service-info-records info)))))
 
+(defparameter *probe-conflict-backoff* 1.0
+  "Seconds to wait after a probe conflict before probing a new name (§8.1).")
+
 (defun probe-name (responder info &key (max-attempts 20))
   "Probe INFO's instance name three times (250ms apart).  On a detected conflict,
-rename via NEXT-INSTANCE-NAME (mutating INFO) and probe again.  Returns INFO once
-a name is successfully claimed."
+wait a second, rename via NEXT-INSTANCE-NAME (mutating INFO), and probe again.
+Returns INFO once a name is successfully claimed."
   (dotimes (attempt max-attempts
                     (error "0conf: no free name for ~S after ~D attempts"
                            (service-info-name info) max-attempts))
@@ -300,8 +350,10 @@ a name is successfully claimed."
           (setf (responder-probing responder) nil
                 (responder-probe-records responder) '())))
       (if (responder-conflict responder)
-          (setf (service-info-name info)
-                (next-instance-name (service-info-name info)))
+          (progn
+            (sleep *probe-conflict-backoff*)     ; rate-limit re-probing (§8.1)
+            (setf (service-info-name info)
+                  (next-instance-name (service-info-name info))))
           (return info)))))
 
 (defun announce (responder records)
@@ -310,7 +362,7 @@ RFC 6762 §8.3 asks for at least two, at least 1s apart."
   (let ((message (encode-message
                   (make-dns-message :flags +flag-response+ :answers records))))
     (dotimes (i 2)
-      (mdns-send (responder-socket responder) message)
+      (broadcast responder message)
       (sleep 1))))
 
 (defun register-service (responder info &key (probe t))
@@ -331,7 +383,7 @@ reflected."
 §10.1).  Builds a fresh record set, so it never mutates our live records."
   (let ((goodbye (service-info-records info)))
     (dolist (r goodbye) (setf (rr-ttl r) 0))
-    (mdns-send (responder-socket responder)
+    (broadcast responder
                (encode-message
                 (make-dns-message :flags +flag-response+ :answers goodbye)))))
 
