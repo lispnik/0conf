@@ -56,13 +56,20 @@ and start the listener + sweeper threads."
     (bordeaux-threads:with-lock-held ((responder-lock responder))
       (ignore-errors (cache-expire (responder-cache responder))))))
 
+(defparameter *listen-poll-interval* 1.0
+  "Max seconds the listener blocks per iteration before re-checking RUNNING.")
+
 (defun responder-loop (responder)
+  ;; Poll with a timeout rather than a plain blocking recv: on Linux, closing the
+  ;; socket from STOP-RESPONDER does NOT wake a thread blocked in recvfrom, so a
+  ;; blocking recv would hang shutdown.  A bounded wait lets the loop notice
+  ;; RUNNING going false and exit promptly on every platform.
   (loop while (responder-running responder) do
     (handler-case
-        (multiple-value-bind (octets host port) (mdns-recv (responder-socket responder))
+        (multiple-value-bind (octets host port)
+            (mdns-recv-timeout (responder-socket responder) *listen-poll-interval*)
           (when octets (handle-packet responder octets host port)))
-      ;; A closed socket (from STOP-RESPONDER) or a malformed packet must not
-      ;; kill the loop.
+      ;; A closed socket or a malformed packet must not kill the loop.
       (error () nil))))
 
 (defun stop-responder (responder)
