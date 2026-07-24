@@ -25,7 +25,10 @@
   ;; (for §8.2 tiebreaking); the listener sets CONFLICT on collision.
   (probing nil)
   (probe-records '())
-  (conflict nil))
+  (conflict nil)
+  ;; Known-answers from continuation packets (a TC'd known-answer list spilling
+  ;; across datagrams), buffered per source host until the query is answered.
+  (pending-ka (make-hash-table :test 'equal)))
 
 (defun response-p (message)
   (logbitp 15 (dns-message-flags message)))   ; QR bit
@@ -107,17 +110,39 @@ doesn't grow).  Wakes often enough that STOP-RESPONDER is prompt."
 
 ;;; --- inbound ---------------------------------------------------------------
 
+(defun continuation-packet-p (message)
+  "A query carrying known-answers but no questions — the tail of a known-answer
+list that a querier split across packets with the TC bit (RFC 6762 §7.2)."
+  (and (null (dns-message-questions message))
+       (dns-message-answers message)))
+
+(defun buffer-known-answers (responder host records)
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (setf (gethash host (responder-pending-ka responder))
+          (append records (gethash host (responder-pending-ka responder))))))
+
+(defun take-known-answers (responder host)
+  "Return and clear the buffered continuation known-answers for HOST."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (prog1 (gethash host (responder-pending-ka responder))
+      (remhash host (responder-pending-ka responder)))))
+
 (defun handle-packet (responder octets host port &optional (socket (responder-socket responder)))
   (let ((message (decode-message octets)))
-    (if (response-p message)
-        (let ((records (append (dns-message-answers message)
-                               (dns-message-additionals message))))
-          (bordeaux-threads:with-lock-held ((responder-lock responder))
-            (dolist (r records) (cache-add (responder-cache responder) r)))
-          (detect-conflict responder records))
-        (progn
-          (tiebreak-probe responder message)
-          (answer-query responder message host port socket)))))
+    (cond
+      ((response-p message)
+       (let ((records (append (dns-message-answers message)
+                              (dns-message-additionals message))))
+         (bordeaux-threads:with-lock-held ((responder-lock responder))
+           (dolist (r records) (cache-add (responder-cache responder) r)))
+         (detect-conflict responder records)))
+      ;; A continuation of a TC'd known-answer list: stash it for the pending
+      ;; query from this host rather than treating it as a query.
+      ((continuation-packet-p message)
+       (buffer-known-answers responder host (dns-message-answers message)))
+      (t
+       (tiebreak-probe responder message)
+       (answer-query responder message host port socket)))))
 
 (defun detect-conflict (responder records)
   "A *response* answering for the name we're probing means someone already owns
@@ -222,11 +247,14 @@ thread while REGISTER/UNREGISTER-SERVICE mutate the list."
   (bordeaux-threads:with-lock-held ((responder-lock responder))
     (copy-list (responder-records responder))))
 
-(defun build-response (responder message)
+(defun build-response (responder message
+                       &optional (known-answers (dns-message-answers message)))
   "Compute the response to MESSAGE against our records, as
 (values answers additionals).  Answers to *all* the query's questions are
-aggregated into one response (RFC 6762 §7.4).  Pure apart from a locked snapshot
-of the record list, so it is unit-testable.
+aggregated into one response (RFC 6762 §7.4).  KNOWN-ANSWERS is the querier's
+known-answer list to suppress against — defaulting to the message's own, but the
+caller may pass a list merged across continuation packets (§7.2).  Pure apart
+from a locked snapshot of the record list, so it is unit-testable.
 
 Includes on-demand NSEC (RFC 6762 §6.1): a positive answer carries our NSEC for
 that name in Additional so the querier learns the full type set; a specific-type
@@ -238,8 +266,7 @@ negative response."
     (dolist (question (dns-message-questions message))
       (let ((matched (remove-if-not
                       (lambda (r) (and (record-answers-question-p r question)
-                                       (not (known-answer-p
-                                             r (dns-message-answers message)))))
+                                       (not (known-answer-p r known-answers))))
                       records)))
         (cond
           (matched
@@ -276,6 +303,16 @@ negative response."
      :answers (cap answers)
      :additionals (cap additionals))))
 
+(defun surviving-answers (answers cache already-matched)
+  "Drop answers a *peer* multicast during our response delay: an answer now in
+the cache that wasn't already there when we scheduled the response (RFC 6762 §6
+duplicate-response suppression).  ALREADY-MATCHED are the answers that had a
+cache match up front (e.g. our own looped-back records), which we keep."
+  (remove-if (lambda (r)
+               (and (not (member r already-matched))
+                    (cache-has-answer-p cache r)))
+             answers))
+
 (defun answer-query (responder message host port &optional (socket (responder-socket responder)))
   (multiple-value-bind (answers additionals) (build-response responder message)
     (when (or answers additionals)
@@ -283,19 +320,34 @@ negative response."
              (legacy (legacy-query-p port))
              (unicast (or legacy
                           (and questions
-                               (question-unicast-response (first questions)))))
-             (reply (encode-message
-                     (make-response-message message answers additionals legacy))))
+                               (question-unicast-response (first questions))))))
         (cond
           (unicast
-           (mdns-send socket reply :host host :port port))
+           ;; Immediate, no aggregation delay or suppression.
+           (mdns-send socket
+                      (encode-message (make-response-message message answers additionals legacy))
+                      :host host :port port))
           (t
-           (when *response-delay*
-             ;; A truncated query means more known-answers are coming; wait a bit
-             ;; longer to collect them before answering (RFC 6762 §7.2).
-             (sleep (+ 0.02 (random 0.1)
-                       (if (message-truncated-p message) 0.4 0.0))))
-           (mdns-send socket reply)))))))
+           ;; Multicast: delay (longer if the query was truncated), then apply
+           ;; known-answer suppression against continuation packets that arrived
+           ;; meanwhile, and drop answers a peer already sent.
+           (let ((already (remove-if-not
+                           (lambda (r) (cache-has-answer-p (responder-cache responder) r))
+                           answers)))
+             (when *response-delay*
+               (sleep (+ 0.02 (random 0.1)
+                         (if (message-truncated-p message) 0.4 0.0))))
+             (let ((known (append (dns-message-answers message)
+                                  (take-known-answers responder host))))
+               (multiple-value-bind (final-answers final-additionals)
+                   (build-response responder message known)
+                 (let ((surviving (surviving-answers final-answers
+                                                     (responder-cache responder) already)))
+                   (when (or surviving final-additionals)
+                     (mdns-send socket
+                                (encode-message
+                                 (make-response-message message surviving
+                                                        final-additionals nil))))))))))))))
 
 ;;; --- outbound: register / announce / goodbye -------------------------------
 

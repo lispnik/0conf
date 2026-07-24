@@ -144,6 +144,55 @@ A record in the Authority section."
       (is (typep (first answers) 'nsec-record))
       (is (not (member +type-aaaa+ (nsec-types (first answers))))))))
 
+(test duplicate-response-suppression
+  "surviving-answers drops an answer a peer already sent (now in the cache) but
+keeps one that was already matched up front (our own looped-back record)."
+  (let* ((rec (make-instance 'a-record :name "h.local" :cache-flush t
+                                       :address (parse-ipv4 "10.0.0.1")))
+         (cache (make-cache)))
+    (cache-add cache (make-instance 'a-record :name "h.local"
+                                              :address (parse-ipv4 "10.0.0.1")))
+    ;; peer's copy is in the cache and it wasn't ours -> suppressed
+    (is (null (0conf::surviving-answers (list rec) cache '())))
+    ;; but if it was already matched (already-matched contains it) -> kept
+    (is (equal (list rec) (0conf::surviving-answers (list rec) cache (list rec))))
+    ;; nothing matching in the cache -> kept
+    (let ((other (make-instance 'a-record :name "h.local"
+                                          :address (parse-ipv4 "10.0.0.9"))))
+      (is (equal (list other) (0conf::surviving-answers (list other) cache '()))))))
+
+(test known-answer-suppression-across-continuation
+  "build-response suppresses an answer listed in a merged known-answer list, as
+if it had arrived in a continuation packet (§7.2)."
+  (let* ((info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                  :port 1 :addresses (list (parse-ipv4 "10.0.0.1"))))
+         (r (responder-advertising info))
+         (q (make-dns-message
+             :questions (list (make-question :name "h.local" :qtype +type-a+))))
+         ;; the querier already knows our A record (fresh) — supplied as if merged
+         ;; from a continuation packet
+         (known (list (make-instance 'a-record :name "h.local" :ttl 120
+                                               :address (parse-ipv4 "10.0.0.1")))))
+    ;; without the known-answer, we'd answer with the A record
+    (is (find-if (lambda (x) (typep x 'a-record)) (0conf::build-response r q)))
+    ;; with it in the (merged) known-answers, the A is suppressed
+    (is (not (find-if (lambda (x) (typep x 'a-record))
+                      (0conf::build-response r q known))))))
+
+(test continuation-packet-buffering
+  "A query with known-answers but no questions is buffered per host, not answered."
+  (let* ((r (make-responder))
+         (ka (make-instance 'a-record :name "h.local" :ttl 120
+                                      :address (parse-ipv4 "10.0.0.1")))
+         (cont (encode-message (make-dns-message :answers (list ka)))))
+    (is (0conf::continuation-packet-p (decode-message cont)))
+    (0conf::handle-packet r cont "10.0.0.2" 5353)          ; buffered, no reply attempted
+    (let ((buffered (0conf::take-known-answers r "10.0.0.2")))
+      (is (= 1 (length buffered)))
+      (is (string= "h.local" (rr-name (first buffered)))))
+    ;; taken -> buffer now empty
+    (is (null (0conf::take-known-answers r "10.0.0.2")))))
+
 (test build-response-aggregates-multiple-questions
   "Answers to all of a query's questions are aggregated into one response (§7.4)."
   (let* ((info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"

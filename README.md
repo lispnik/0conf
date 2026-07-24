@@ -123,11 +123,14 @@ OS forbids binding 5353.
   also attaches them on demand (RFC 6762 §6.1): a positive answer carries the
   name's NSEC in Additional, and a query for a type we don't hold at a name we
   own is answered with the NSEC as a negative response.
-- **Response timing & cache-flush:** answers to all of a query's questions are
+- **Response timing & suppression:** answers to all of a query's questions are
   aggregated into one response (§7.4); multicast responses are delayed a random
   20–120ms (§6), extended when the query's TC bit signals more known-answers are
-  coming (§7.2); cache-flush eviction spares records received within the last
-  second so multi-packet responses aren't self-destructive (§10.2).
+  coming (§7.2); known-answers spanning multiple packets are reassembled per
+  source before suppression; and an answer a peer multicasts during our delay is
+  dropped (duplicate-response suppression, §6). Cache-flush eviction spares
+  records received within the last second so multi-packet responses aren't
+  self-destructive (§10.2).
 - **Legacy unicast queries (§6.7):** a query from a source port other than 5353
   gets a unicast reply with the query id echoed, the question repeated, and TTLs
   capped at 10s.
@@ -146,4 +149,5 @@ OS forbids binding 5353.
   cache entries so removals happen on time. Cross-thread cache access is guarded
   by the responder lock.
 - **Remaining TODOs:** embedded-IPv4 IPv6 literals (`::ffff:1.2.3.4`), DNS-SD
-  instance-name escaping, subtypes, and active duplicate-response suppression.
+  instance-name escaping, subtypes, binary TXT values, and inbound NFC
+  normalization.

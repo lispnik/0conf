@@ -99,6 +99,16 @@ Returns :ADDED, :UPDATED, or :REMOVED."
              (cache-table cache))
     (nreverse out)))
 
+(defun cache-has-answer-p (cache record)
+  "True if the cache already holds a matching record (name/type/class/rdata) with
+at least half RECORD's TTL remaining — i.e. someone else has answered this.  Used
+for duplicate-response suppression (RFC 6762 §6)."
+  (let ((half (floor (rr-ttl record) 2)))
+    (some (lambda (e)
+            (and (rdata-equal (cache-entry-record e) record)
+                 (>= (rr-ttl (cache-entry-record e)) half)))
+          (gethash (record-bucket-key record) (cache-table cache)))))
+
 (defun cache-needs-refresh-p (cache &optional (now (get-universal-time)))
   "True once some live entry passes 80% of its lifetime — the cue to re-query so
 records we care about don't silently expire (RFC 6762 §5.2)."
