@@ -43,7 +43,8 @@
    #:service-instance-name #:service-info-records #:service-info-from-records
    #:txt-alist->strings #:txt-strings->alist
    ;; transport
-   #:mdns-socket #:make-mdns-socket #:mdns-send #:mdns-recv #:close-mdns-socket
+   #:mdns-socket #:make-mdns-socket #:mdns-send #:mdns-recv #:mdns-recv-timeout
+   #:close-mdns-socket
    ;; responder / browser / public API
    #:responder #:make-responder #:start-responder #:stop-responder
    #:register-service #:unregister-service

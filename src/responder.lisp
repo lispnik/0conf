@@ -35,8 +35,10 @@
 (defparameter *cache-sweep-interval* 1.0
   "Seconds between background cache-expiry sweeps.")
 
-(defun start-responder (responder)
-  (setf (responder-socket responder) (make-mdns-socket)
+(defun start-responder (responder &key socket)
+  "Open the mDNS socket (or use the provided SOCKET, for testing over loopback)
+and start the listener + sweeper threads."
+  (setf (responder-socket responder) (or socket (make-mdns-socket))
         (responder-running responder) t
         (responder-thread responder)
         (bordeaux-threads:make-thread (lambda () (responder-loop responder))
@@ -64,6 +66,11 @@
       (error () nil))))
 
 (defun stop-responder (responder)
+  ;; Best-effort: withdraw everything we advertised before going away, so peers
+  ;; drop our records immediately instead of waiting for TTL expiry.
+  (dolist (info (bordeaux-threads:with-lock-held ((responder-lock responder))
+                  (copy-list (responder-services responder))))
+    (ignore-errors (send-goodbye responder info)))
   (setf (responder-running responder) nil)
   (when (responder-socket responder)
     (close-mdns-socket (responder-socket responder)))
@@ -173,40 +180,48 @@ per RFC 6762 known-answer suppression."
 which spreads simultaneous responders and lets answers aggregate.  Bound to NIL
 in tests.")
 
-(defun own-name-p (responder name)
-  (some (lambda (r) (string-equal (rr-name r) name)) (responder-records responder)))
+(defun own-name-p (records name)
+  (some (lambda (r) (string-equal (rr-name r) name)) records))
 
-(defun nsec-at (responder name)
+(defun nsec-at (records name)
   (find-if (lambda (r) (and (typep r 'nsec-record)
                             (string-equal (rr-name r) name)))
-           (responder-records responder)))
+           records))
+
+(defun responder-records-snapshot (responder)
+  "A locked copy of our authoritative records — safe to read from the listener
+thread while REGISTER/UNREGISTER-SERVICE mutate the list."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (copy-list (responder-records responder))))
 
 (defun build-response (responder message)
   "Compute the response to MESSAGE against our records, as
-(values answers additionals).  Pure — no I/O — so it is unit-testable.
+(values answers additionals).  Pure apart from a locked snapshot of the record
+list, so it is unit-testable.
 
 Includes on-demand NSEC (RFC 6762 §6.1): a positive answer carries our NSEC for
 that name in Additional so the querier learns the full type set; a specific-type
 query for a name we own but lack that type is answered with the NSEC as a
 negative response."
-  (let ((answers '())
+  (let ((records (responder-records-snapshot responder))
+        (answers '())
         (additionals '()))
     (dolist (question (dns-message-questions message))
       (let ((matched (remove-if-not
                       (lambda (r) (and (record-answers-question-p r question)
                                        (not (known-answer-p
                                              r (dns-message-answers message)))))
-                      (responder-records responder))))
+                      records)))
         (cond
           (matched
            (dolist (r matched) (pushnew r answers))
-           (let ((nsec (nsec-at responder (question-name question))))
+           (let ((nsec (nsec-at records (question-name question))))
              (when (and nsec (not (member nsec answers)))
                (pushnew nsec additionals))))
           ;; Negative answer: we own the name but not the requested type.
           ((and (/= (question-qtype question) +type-any+)
-                (own-name-p responder (question-name question)))
-           (let ((nsec (nsec-at responder (question-name question))))
+                (own-name-p records (question-name question)))
+           (let ((nsec (nsec-at records (question-name question))))
              (when (and nsec (not (member (question-qtype question) (nsec-types nsec))))
                (pushnew nsec answers)))))))
     (values (nreverse answers) (nreverse additionals))))
@@ -304,13 +319,18 @@ reflected."
     (announce responder records)
     info))
 
-(defun unregister-service (responder info)
-  "Send goodbye packets (ttl 0) and drop INFO's records."
+(defun send-goodbye (responder info)
+  "Announce INFO's records with ttl 0 so listeners drop them at once (RFC 6762
+§10.1).  Builds a fresh record set, so it never mutates our live records."
   (let ((goodbye (service-info-records info)))
     (dolist (r goodbye) (setf (rr-ttl r) 0))
     (mdns-send (responder-socket responder)
                (encode-message
-                (make-dns-message :flags +flag-response+ :answers goodbye))))
+                (make-dns-message :flags +flag-response+ :answers goodbye)))))
+
+(defun unregister-service (responder info)
+  "Send a goodbye and drop INFO's records."
+  (send-goodbye responder info)
   (let ((instance (service-instance-name info)))
     (bordeaux-threads:with-lock-held ((responder-lock responder))
       (setf (responder-services responder)
