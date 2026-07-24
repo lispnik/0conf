@@ -4,3 +4,6 @@
 # Compiled output
 *.fasl
 *.abcl
+
+# Tangled from doc/tutorial.org (the .org is the source of truth)
+/doc/tutorial.lisp

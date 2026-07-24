@@ -50,3 +50,14 @@ jobs:
 
       - name: Run test suite
         run: sbcl --non-interactive --eval '(asdf:test-system :0conf)'
+
+      - name: Install Emacs (Linux, for tutorial tangling)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y emacs-nox
+
+      - name: Tangle and run the literate tutorial
+        if: runner.os == 'Linux'
+        run: |
+          emacs --batch --eval "(require 'org)" \
+                --eval '(org-babel-tangle-file "doc/tutorial.org")'
+          sbcl --non-interactive --load doc/tutorial.lisp

@@ -49,6 +49,19 @@ SBCL only (the multicast transport uses `sb-bsd-sockets` + `sb-alien`).
   (0conf:stop r))
 ```
 
+## Tutorial
+
+[`doc/tutorial.org`](doc/tutorial.org) is a literate, tangle-able walkthrough of
+the pure API (wire codec, service expansion, cache, reassembly, NFC names). It
+tangles into a self-checking `doc/tutorial.lisp`:
+
+```sh
+emacs --batch --eval "(require 'org)" --eval '(org-babel-tangle-file "doc/tutorial.org")'
+sbcl --non-interactive --load doc/tutorial.lisp     # 15 checks, all self-asserting
+```
+
+CI tangles and runs it on every push, so the tutorial can't drift from working code.
+
 ## Develop
 
 Dependencies are managed with [ocicl](https://github.com/ocicl/ocicl):
