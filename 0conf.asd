@@ -34,6 +34,7 @@
                (:file "responder-tests")
                (:file "browser-tests")
                (:file "transport-tests")
-               (:file "integration-tests"))
+               (:file "integration-tests")
+               (:file "interop-tests"))
   :perform (test-op (o c)
              (uiop:symbol-call :0conf/test '#:run-tests)))

@@ -90,9 +90,12 @@ ocicl install                             # restore deps from ocicl.csv
 sbcl --eval '(asdf:test-system :0conf)'   # 58 checks, all pure + FFI socket
 ```
 
-The test suite is pure (codec / records / cache / DNS-SD) plus one guarded
-socket-construction test; it needs no network and skips the socket test if the
-OS forbids binding 5353.
+The test suite is mostly pure (codec / records / cache / DNS-SD), plus
+loopback-socket integration tests (real send/receive, a full query→responder→
+answer flow, `browse-once`, `resolve`), guarded socket-construction tests, and
+**interop fixtures** — real mDNS packets captured from Apple's mDNSResponder,
+decoded to prove we parse genuine Bonjour wire data (real name compression, the
+QU bit, header flags), not just our own encoder's output.
 
 ## Platform notes
 
