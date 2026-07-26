@@ -28,6 +28,22 @@
 
 (defparameter +esc+ (code-char 27))
 
+(defparameter +well-known-types+
+  '("_http._tcp.local" "_https._tcp.local"
+    "_ipp._tcp.local" "_ipps._tcp.local" "_printer._tcp.local" "_pdl-datastream._tcp.local"
+    "_scanner._tcp.local" "_uscan._tcp.local" "_uscans._tcp.local"
+    "_airplay._tcp.local" "_raop._tcp.local" "_airport._tcp.local" "_appletv-v2._tcp.local"
+    "_companion-link._tcp.local" "_touch-able._tcp.local" "_device-info._tcp.local"
+    "_googlecast._tcp.local" "_spotify-connect._tcp.local" "_sonos._tcp.local"
+    "_soundtouch._tcp.local" "_amzn-wplay._tcp.local"
+    "_hap._tcp.local" "_matter._tcp.local" "_meshcop._udp.local"
+    "_ssh._tcp.local" "_sftp-ssh._tcp.local" "_rfb._tcp.local" "_teamviewer._tcp.local"
+    "_smb._tcp.local" "_afpovertcp._tcp.local" "_nfs._tcp.local" "_webdav._tcp.local"
+    "_daap._tcp.local" "_dacp._tcp.local" "_workstation._tcp.local")
+  "Common DNS-SD types the live monitor always browses, on top of whatever the
+meta-query enumerates — some devices answer a direct browse but not the type
+enumeration.  A type with no instances stays silent, so this only ever adds.")
+
 ;;; --- formatting helpers ----------------------------------------------------
 
 (defun ensure-local (name)
@@ -163,7 +179,10 @@
              (format t "~C[?25l" +esc+)                ; hide cursor
              (format t "~C[H~C[2J  discovering services…~%" +esc+ +esc+)
              (finish-output)
-             ;; poll for service *types* in the background; open a browser per type
+             ;; always sweep the well-known types (some devices answer a direct
+             ;; browse but ignore the meta-query)
+             (dolist (ty +well-known-types+) (ensure-browser ty))
+             ;; ...and keep discovering any *other* types the network advertises
              (setf type-thread
                    (bordeaux-threads:make-thread
                     (lambda ()

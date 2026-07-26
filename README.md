@@ -70,9 +70,13 @@ scripts/build-cli.sh            # build ./0conf   (add --sign on macOS, see belo
 ```
 
 `monitor` starts a responder (one socket per interface, so it watches every link),
-keeps a live browser per discovered type, and redraws a grouped view as services
-appear, change, and disappear — like `dns-sd -B` / `avahi-browse -a`, but as a
-dashboard.
+keeps a live browser per type, and redraws a grouped view as services appear,
+change, and disappear — like `dns-sd -B` / `avahi-browse -a`, but as a dashboard.
+It browses both the types the DNS-SD meta-query enumerates *and* a built-in list
+of well-known types (printers, Chromecast, HomeKit, SSH, SMB, …), since some
+devices answer a direct browse but ignore the meta-query. (On a client-isolated
+network — common at cafés — you'll still only see your own device; that's the
+access point blocking peer traffic, not the tool.)
 
 `browse` with no argument runs the DNS-SD meta-query
 (`_services._dns-sd._udp.local`, [RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9))
