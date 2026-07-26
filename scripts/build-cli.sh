@@ -24,21 +24,28 @@ if [ "${1:-}" = "--sign" ]; then
     echo "--sign is only meaningful on macOS; skipping." >&2
     exit 0
   fi
-  ENT="$(mktemp -t 0conf-multicast).entitlements"
-  cat > "$ENT" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
- "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>com.apple.developer.networking.multicast</key>
-  <true/>
-</dict>
-</plist>
-PLIST
-  echo "Ad-hoc signing ./0conf with the multicast entitlement ..."
-  codesign --force --sign - --entitlements "$ENT" --timestamp=none ./0conf
-  codesign -d --entitlements - ./0conf 2>/dev/null || true
-  rm -f "$ENT"
-  echo "Signed.  First run may prompt for Local Network access."
+  # NOTE: an SBCL save-lisp-and-die executable appends its ~40 MB Lisp core AFTER
+  # the Mach-O.  codesign rejects that ("main executable failed strict
+  # validation"), and ldid embeds the entitlement but only hashes the Mach-O, so
+  # the signature is invalid over the full file and macOS SIGKILLs it on launch.
+  # In short: the multicast entitlement can't be embedded in this binary.
+  #
+  # It doesn't need to be: on macOS the gate for mDNS is the *Local Network*
+  # privacy permission (TCC), not this entitlement.  See doc/macos-multicast.md.
+  ENT="scripts/multicast.entitlements"
+  echo "Attempting to codesign ./0conf with $ENT ..."
+  if codesign --force --sign - --entitlements "$ENT" --timestamp=none ./0conf 2>/dev/null; then
+    echo "Signed."
+  else
+    cat >&2 <<'NOTE'
+codesign could not sign the SBCL executable (appended Lisp core).  This is
+expected and does NOT break the binary.  The multicast entitlement cannot be
+embedded in a save-lisp-and-die executable.
+
+To let ./0conf do mDNS on macOS, grant it Local Network access instead:
+  System Settings -> Privacy & Security -> Local Network  (enable ./0conf or your
+  terminal), or run:  tccutil reset LocalNetwork  and re-run the program.
+See doc/macos-multicast.md.
+NOTE
+  fi
 fi

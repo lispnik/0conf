@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Lets the signed binary send/receive multicast (mDNS 224.0.0.251:5353 /
+       ff02::fb) on macOS.  Ad-hoc signing with this is enough for local dev;
+       shipping it needs the entitlement granted by Apple. -->
+  <key>com.apple.developer.networking.multicast</key>
+  <true/>
+</dict>
+</plist>
