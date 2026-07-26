@@ -50,6 +50,6 @@
    ;; responder / browser / public API
    #:responder #:make-responder #:start-responder #:stop-responder
    #:register-service #:unregister-service #:update-service-txt
-   #:browse #:browse-once #:resolve
+   #:browse #:browse-once #:resolve #:enumerate-service-types
    #:service-browser #:browse-services #:stop-browse
    #:start #:stop))

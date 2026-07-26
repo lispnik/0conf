@@ -21,6 +21,17 @@
                (:file "0conf"))       ; public start/stop API
   :in-order-to ((test-op (test-op "0conf/test"))))
 
+(defsystem "0conf/cli"
+  :description "Command-line mDNS/DNS-SD browser built on 0conf."
+  :author "Mike Kennedy"
+  :license "MIT"
+  :depends-on ("0conf")
+  :pathname "src"
+  :components ((:file "cli"))
+  :build-operation "program-op"
+  :build-pathname "../0conf"          ; land at the repo root, not src/
+  :entry-point "0conf-cli:toplevel")
+
 (defsystem "0conf/test"
   :description "FiveAM test suite for 0conf."
   :depends-on ("0conf" "fiveam")

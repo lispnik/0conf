@@ -165,3 +165,28 @@ response delivered to its socket."
           (close-mdns-socket sock)
           (close-mdns-socket sender)))
     (error (e) (skip "loopback resolve unavailable: ~A" e))))
+
+(test enumerate-service-types-over-loopback
+  "enumerate-service-types collects service TYPES from a meta-query PTR response
+delivered to its socket (RFC 6763 §9)."
+  (handler-case
+      (let* ((sock (ephemeral-socket))
+             (sender (ephemeral-socket))
+             (meta "_services._dns-sd._udp.local")
+             (response (encode-message
+                        (make-dns-message
+                         :flags +flag-response+
+                         :answers (list (make-instance 'ptr-record :name meta
+                                                       :rtype +type-ptr+ :target "_http._tcp.local")
+                                        (make-instance 'ptr-record :name meta
+                                                       :rtype +type-ptr+ :target "_ipp._tcp.local"))))))
+        (unwind-protect
+             (progn
+               (mdns-send sender response :host "127.0.0.1" :port (local-port sock))
+               (sleep 0.1)
+               (let ((types (enumerate-service-types :timeout 0.5 :socket sock)))
+                 (is (member "_http._tcp.local" types :test #'string=))
+                 (is (member "_ipp._tcp.local" types :test #'string=))))
+          (close-mdns-socket sock)
+          (close-mdns-socket sender)))
+    (error (e) (skip "loopback enumerate unavailable: ~A" e))))

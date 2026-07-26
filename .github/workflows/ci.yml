@@ -51,6 +51,12 @@ jobs:
       - name: Run test suite
         run: sbcl --non-interactive --eval '(asdf:test-system :0conf)'
 
+      - name: Build and smoke-test the CLI
+        run: |
+          ./scripts/build-cli.sh
+          ./0conf help
+          ./0conf browse            # no multicast on the runner -> exits 0 cleanly
+
       - name: Install Emacs (Linux, for tutorial tangling)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y emacs-nox

@@ -10,3 +10,6 @@
 
 # Generated sb-cover report
 /coverage/
+
+# Built CLI executable
+/0conf

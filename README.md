@@ -53,6 +53,28 @@ SBCL only (the multicast transport uses `sb-bsd-sockets` + `sb-alien`).
   (0conf:stop r))
 ```
 
+## Command-line tool
+
+The `0conf/cli` system builds a small standalone `0conf` command:
+
+```sh
+scripts/build-cli.sh            # build ./0conf   (add --sign on macOS, see below)
+
+./0conf browse                  # list the DNS-SD service types on the LAN
+./0conf browse _airplay._tcp    # list instances of a type (host / port / TXT)
+./0conf resolve "Front Desk._ipp._tcp.local"
+./0conf help
+```
+
+`browse` with no argument runs the DNS-SD meta-query
+(`_services._dns-sd._udp.local`, [RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9))
+to enumerate the service types on the link — the same thing `dns-sd -B` does.
+
+On macOS a raw binary needs Local Network / multicast access to send mDNS:
+`scripts/build-cli.sh --sign` ad-hoc-signs the executable with the
+`com.apple.developer.networking.multicast` entitlement, and the first run prompts
+for Local Network access.
+
 ## Tutorial
 
 [`doc/tutorial.org`](doc/tutorial.org) is a literate, tangle-able walkthrough of

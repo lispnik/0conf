@@ -58,6 +58,43 @@ SOCKET, if given, is used instead of opening one (and is left open) — for test
            (assemble-services cache type))
       (when own-socket (close-mdns-socket socket)))))
 
+(defparameter +dns-sd-meta-query+ "_services._dns-sd._udp.local"
+  "The DNS-SD service-type enumeration name (RFC 6763 §9).")
+
+(defun enumerate-service-types (&key (timeout 2.0) interface socket)
+  "Enumerate the DNS-SD service *types* advertised on the local link — RFC 6763
+§9's meta-query, the same thing `dns-sd -B _services._dns-sd._udp` does.  Returns a
+sorted list of type strings such as \"_http._tcp.local\".  SOCKET, if given, is
+used instead of opening one (and left open) — for tests."
+  (let* ((own-socket (null socket))
+         (socket (or socket (make-mdns-socket :interface interface)))
+         (cache (make-cache)))
+    (unwind-protect
+         (progn
+           (ignore-errors
+             (mdns-send socket
+                        (encode-message
+                         (make-dns-message
+                          :questions (list (make-question :name +dns-sd-meta-query+
+                                                          :qtype +type-ptr+))))))
+           (let ((deadline (+ (get-internal-real-time)
+                              (round (* timeout internal-time-units-per-second)))))
+             (loop for remaining = (/ (- deadline (get-internal-real-time))
+                                      internal-time-units-per-second)
+                   while (plusp remaining)
+                   do (let ((octets (mdns-recv-timeout socket (float remaining 1.0))))
+                        (when octets
+                          (let ((message (decode-message octets)))
+                            (dolist (r (append (dns-message-answers message)
+                                               (dns-message-additionals message)))
+                              (cache-add cache r)))))))
+           (sort (remove-duplicates
+                  (loop for r in (cache-get cache +dns-sd-meta-query+ +type-ptr+)
+                        collect (ptr-target r))
+                  :test #'string-equal)
+                 #'string<))
+      (when own-socket (close-mdns-socket socket)))))
+
 (defun instance-type (instance)
   "The service type of a fully-qualified INSTANCE name — everything after the
 first (instance) label.  \"My Printer._ipp._tcp.local\" -> \"_ipp._tcp.local\"."
