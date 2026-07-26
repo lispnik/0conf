@@ -62,9 +62,17 @@ scripts/build-cli.sh            # build ./0conf   (add --sign on macOS, see belo
 
 ./0conf browse                  # list the DNS-SD service types on the LAN
 ./0conf browse _airplay._tcp    # list instances of a type (host / port / TXT)
+./0conf monitor                 # live, self-updating view of all services (Ctrl-C to quit)
 ./0conf resolve "Front Desk._ipp._tcp.local"
 ./0conf help
+
+./0conf -i 192.168.1.42 browse  # pin the multicast egress interface (browse/resolve)
 ```
+
+`monitor` starts a responder (one socket per interface, so it watches every link),
+keeps a live browser per discovered type, and redraws a grouped view as services
+appear, change, and disappear — like `dns-sd -B` / `avahi-browse -a`, but as a
+dashboard.
 
 `browse` with no argument runs the DNS-SD meta-query
 (`_services._dns-sd._udp.local`, [RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9))

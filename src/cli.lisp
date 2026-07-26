@@ -3,12 +3,16 @@
 ;;;; Sub-commands:
 ;;;;   0conf browse                 list the DNS-SD service types on the LAN
 ;;;;   0conf browse <type>          list instances of a type (e.g. _http._tcp)
+;;;;   0conf monitor                live, self-updating view of all services
 ;;;;   0conf resolve <instance>     resolve one instance to host / port / TXT
 ;;;;   0conf help                   usage
 ;;;;
+;;;; A leading `-i <addr>` / `--interface <addr>` pins the multicast egress
+;;;; interface for the one-shot commands (browse/resolve).
+;;;;
 ;;;; Built as a standalone executable with `asdf:make :0conf/cli` (see
 ;;;; scripts/build-cli.sh).  Every command needs working multicast — on macOS a
-;;;; raw binary needs the Local Network permission / multicast entitlement.
+;;;; raw binary needs Local Network access (see doc/macos-multicast.md).
 
 (defpackage #:0conf-cli
   (:use #:cl)
@@ -18,6 +22,11 @@
 
 (defparameter *program* "0conf"
   "Name printed in usage/help — matches the built executable.")
+
+(defvar *interface* nil
+  "Dotted-quad egress interface for the one-shot commands, or NIL for the default.")
+
+(defparameter +esc+ (code-char 27))
 
 ;;; --- formatting helpers ----------------------------------------------------
 
@@ -41,22 +50,28 @@
         ((stringp v) v)
         (t (map 'string #'code-char v))))
 
+(defun host-port (info)
+  "\"host:port\" for INFO, or \"\" if its host isn't known yet."
+  (let ((h (0conf:service-info-host info)))
+    (if (and h (plusp (length h)))
+        (format nil "~A:~A" h (0conf:service-info-port info))
+        "")))
+
 (defun print-service (info &optional (stream *standard-output*))
   "Print one SERVICE-INFO: name, host:port, addresses, and TXT key/values."
   (format stream "  ~A~%" (0conf:service-info-name info))
-  (let ((host (0conf:service-info-host info)))
-    (when (and host (plusp (length host)))
-      (format stream "      at   ~A:~A~%" host (0conf:service-info-port info))))
+  (let ((hp (host-port info)))
+    (when (plusp (length hp)) (format stream "      at   ~A~%" hp)))
   (dolist (a (0conf:service-info-addresses info))
     (format stream "      addr ~A~%" (addr-string a)))
   (loop for (k . v) in (0conf:service-info-txt info)
         for vs = (txt-value-string v)
         do (format stream "      txt  ~A~@[=~A~]~%" k vs)))
 
-;;; --- sub-commands ----------------------------------------------------------
+;;; --- browse / resolve (one-shot) -------------------------------------------
 
 (defun browse-types (&key (timeout 3.0))
-  (let ((types (0conf:enumerate-service-types :timeout timeout)))
+  (let ((types (0conf:enumerate-service-types :timeout timeout :interface *interface*)))
     (cond
       (types
        (format t "~&Service types on the local network:~%~%")
@@ -66,12 +81,12 @@
       (t
        (format t "~&No service types found.~%~
                   Nothing is advertising, or multicast isn't reaching the LAN ~
-                  (on macOS a raw binary needs the Local Network permission /~%~
-                  multicast entitlement — see doc/macos-multicast.md).~%")))
+                  (on macOS a raw binary needs Local Network access —~%~
+                  see doc/macos-multicast.md).~%")))
     0))
 
 (defun browse-instances (type &key (timeout 3.0))
-  (let ((infos (sort (copy-list (0conf:browse-once type :timeout timeout))
+  (let ((infos (sort (copy-list (0conf:browse-once type :timeout timeout :interface *interface*))
                      #'string-lessp :key #'0conf:service-info-name)))
     (cond
       (infos
@@ -93,33 +108,130 @@
        (format *error-output* "usage: ~A resolve <instance._type._tcp.local>~%" *program*)
        2)
       (t (let* ((fq (ensure-local instance))
-                (info (0conf:resolve fq)))
+                (info (0conf:resolve fq :interface *interface*)))
            (cond (info (format t "~&~A~%" fq) (print-service info) 0)
                  (t (format t "~&Not found: ~A~%" fq) 1)))))))
+
+;;; --- monitor (live view) ---------------------------------------------------
+;;;
+;;; Starts a responder (one socket per interface, so it watches every link),
+;;; enumerates the service types, and keeps a live browser per type.  A shared
+;;; table of instances is redrawn as services appear, change, and disappear.
+
+(defun render-monitor (infos)
+  (let ((by-type (make-hash-table :test 'equal)))
+    (dolist (i infos)
+      (push i (gethash (0conf:service-info-type i) by-type)))
+    (format t "~C[H~C[2J" +esc+ +esc+)                 ; home + clear
+    (format t "~A monitor — ~D service~:P across ~D type~:P   (Ctrl-C to quit)~2%"
+            *program* (length infos) (hash-table-count by-type))
+    (if (null infos)
+        (format t "  discovering services on the local network…~%")
+        (dolist (ty (sort (loop for k being the hash-keys of by-type collect k) #'string<))
+          (format t "~C[1m~A~C[0m~%" +esc+ ty +esc+)   ; bold type header
+          (dolist (i (sort (copy-list (gethash ty by-type))
+                           #'string-lessp :key #'0conf:service-info-name))
+            (format t "    ~30A ~A~%" (0conf:service-info-name i) (host-port i)))
+          (terpri)))
+    (finish-output)))
+
+(defun cmd-monitor (args)
+  (declare (ignore args))
+  (let ((responder (0conf:start-responder (0conf:make-responder)))
+        (services (make-hash-table :test 'equal))     ; instance name -> service-info
+        (browsers (make-hash-table :test 'equal))     ; type -> service-browser
+        (lock (bordeaux-threads:make-lock "monitor"))
+        (running t)
+        (type-thread nil))
+    (labels ((put (i) (bordeaux-threads:with-lock-held (lock)
+                        (setf (gethash (0conf:service-instance-name i) services) i)))
+             (del (n) (bordeaux-threads:with-lock-held (lock)
+                        (remhash n services)))
+             (ensure-browser (ty)
+               (bordeaux-threads:with-lock-held (lock)
+                 (unless (gethash ty browsers)
+                   (setf (gethash ty browsers)
+                         (0conf:browse-services responder ty
+                                                :on-add    #'put
+                                                :on-update #'put
+                                                :on-remove #'del)))))
+             (snapshot ()
+               (bordeaux-threads:with-lock-held (lock)
+                 (loop for i being the hash-values of services collect i))))
+      (unwind-protect
+           (progn
+             (format t "~C[?25l" +esc+)                ; hide cursor
+             (format t "~C[H~C[2J  discovering services…~%" +esc+ +esc+)
+             (finish-output)
+             ;; poll for service *types* in the background; open a browser per type
+             (setf type-thread
+                   (bordeaux-threads:make-thread
+                    (lambda ()
+                      (loop while running do
+                        (dolist (ty (ignore-errors
+                                     (0conf:enumerate-service-types :timeout 2.0)))
+                          (ensure-browser ty))
+                        (sleep 4)))
+                    :name "0conf-type-poll"))
+             ;; redraw on the main thread until Ctrl-C
+             (handler-case
+                 (loop while running do
+                   (render-monitor (snapshot))
+                   (sleep 1.0))
+               (sb-sys:interactive-interrupt () nil)))
+        (setf running nil)
+        (when type-thread (ignore-errors (bordeaux-threads:join-thread type-thread)))
+        (bordeaux-threads:with-lock-held (lock)
+          (maphash (lambda (ty b) (declare (ignore ty)) (ignore-errors (0conf:stop-browse b)))
+                   browsers))
+        (ignore-errors (0conf:stop-responder responder))
+        (format t "~C[?25h~%" +esc+))))                ; show cursor
+  0)
+
+;;; --- dispatch --------------------------------------------------------------
+
+(defun extract-interface (argv)
+  "Pull a `-i <addr>` / `--interface <addr>` / `--interface=<addr>` option out of
+ARGV.  Returns (values interface remaining-args)."
+  (let ((iface nil) (out '()) (rest argv))
+    (loop while rest
+          for a = (pop rest)
+          do (cond
+               ((and (member a '("-i" "--interface") :test #'string=) rest)
+                (setf iface (pop rest)))
+               ((and (> (length a) 12) (string= "--interface=" (subseq a 0 12)))
+                (setf iface (subseq a 12)))
+               (t (push a out))))
+    (values iface (nreverse out))))
 
 (defun usage (&optional (stream *standard-output*))
   (format stream "~&~A — browse and resolve mDNS / DNS-SD services on the local network.~2%~
                   Usage:~%~
                   ~2T~A browse              list the service types on the LAN~%~
                   ~2T~A browse <type>       list instances of a type (e.g. _http._tcp)~%~
+                  ~2T~A monitor             live, self-updating view of all services~%~
                   ~2T~A resolve <instance>  resolve one instance to host / port / TXT~%~
-                  ~2T~A help                show this help~%"
-          *program* *program* *program* *program* *program*))
-
-;;; --- entry point -----------------------------------------------------------
+                  ~2T~A help                show this help~2%~
+                  Options:~%~
+                  ~2T-i, --interface <addr>  pin the multicast egress interface ~
+                  (browse/resolve)~%"
+          *program* *program* *program* *program* *program* *program*))
 
 (defun main (&optional (argv (rest sb-ext:*posix-argv*)))
   "Dispatch a sub-command.  Returns a Unix exit code."
-  (let ((cmd (first argv))
-        (args (rest argv)))
-    (cond
-      ((null cmd) (usage) 1)
-      ((string= cmd "browse") (cmd-browse args))
-      ((string= cmd "resolve") (cmd-resolve args))
-      ((member cmd '("help" "-h" "--help") :test #'string=) (usage) 0)
-      (t (format *error-output* "~&~A: unknown command ~S~%~%" *program* cmd)
-         (usage *error-output*)
-         2))))
+  (multiple-value-bind (iface rest) (extract-interface argv)
+    (let ((*interface* iface)
+          (cmd (first rest))
+          (args (rest rest)))
+      (cond
+        ((null cmd) (usage) 1)
+        ((string= cmd "browse") (cmd-browse args))
+        ((string= cmd "monitor") (cmd-monitor args))
+        ((string= cmd "resolve") (cmd-resolve args))
+        ((member cmd '("help" "-h" "--help") :test #'string=) (usage) 0)
+        (t (format *error-output* "~&~A: unknown command ~S~%~%" *program* cmd)
+           (usage *error-output*)
+           2)))))
 
 (defun toplevel ()
   "Executable entry point: run MAIN, print any error, and exit with its code."
