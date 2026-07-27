@@ -190,3 +190,50 @@ delivered to its socket (RFC 6763 §9)."
           (close-mdns-socket sock)
           (close-mdns-socket sender)))
     (error (e) (skip "loopback enumerate unavailable: ~A" e))))
+
+(test publish-then-query-over-loopback
+  "The publish path end to end: REGISTER-SERVICE adds a service to a running
+responder, which then answers a client's PTR query for that type (QU bit -> a
+unicast reply, so no multicast is needed).  Exercises register-service +
+service-info-records + answer-query — the machinery behind `0conf publish`."
+  (handler-case
+      (let ((server-sock (ephemeral-socket))
+            (client (ephemeral-socket))
+            (responder (make-responder)))
+        (unwind-protect
+             (progn
+               (start-responder responder :socket server-sock)
+               (register-service
+                responder
+                (make-service-info :type "_x._tcp.local" :name "Pub" :host "pub.local"
+                                   :port 8080 :addresses (list (parse-ipv4 "127.0.0.1"))
+                                   :txt '(("path" . "/status")))
+                :probe nil)             ; probing would need multicast
+               (let ((query (encode-message
+                             (make-dns-message
+                              :questions (list (make-question :name "_x._tcp.local"
+                                                              :qtype +type-ptr+
+                                                              :unicast-response t))))))
+                 (mdns-send client query :host "127.0.0.1" :port (local-port server-sock))
+                 (let ((octets (mdns-recv-timeout client 2.0)))
+                   (is (not (null octets)))
+                   (when octets
+                     (let ((reply (decode-message octets)))
+                       (is (find-if (lambda (r)
+                                      (and (typep r 'ptr-record)
+                                           (string-equal (ptr-target r) "Pub._x._tcp.local")))
+                                    (append (dns-message-answers reply)
+                                            (dns-message-additionals reply)))))))))
+          (stop-responder responder)
+          (close-mdns-socket client)))
+    (error (e) (skip "loopback publish test unavailable: ~A" e))))
+
+(test one-shot-queries-accept-ipv6-family
+  "browse-once / enumerate-service-types / resolve accept :family :ipv6 and open an
+IPv6 mDNS socket (returns cleanly, possibly empty).  Skips where v6 is unavailable."
+  (handler-case
+      (progn
+        (is (listp (enumerate-service-types :timeout 0.3 :family :ipv6)))
+        (is (listp (browse-once "_x._tcp.local" :timeout 0.3 :family :ipv6)))
+        (is (null (resolve "nope._x._tcp.local" :timeout 0.3 :family :ipv6))))
+    (error (e) (skip "IPv6 mDNS unavailable: ~A" e))))

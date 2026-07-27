@@ -54,8 +54,13 @@ jobs:
       - name: Build and smoke-test the CLI
         run: |
           ./scripts/build-cli.sh
+          ./0conf --version
           ./0conf help
-          ./0conf browse            # no multicast on the runner -> exits 0 cleanly
+          ./0conf interfaces --all
+          ./0conf browse || true                     # empty on the runner -> exit 1, that's fine
+          ./0conf monitor --once --timeout 2 || true # bounded; must not hang
+          ./0conf browse --json || true              # JSON path
+          if ./0conf --bogus-flag; then exit 1; fi   # unknown option must fail (nonzero)
 
       - name: Install Emacs (Linux, for tutorial tangling)
         if: runner.os == 'Linux'

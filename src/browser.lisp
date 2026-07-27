@@ -26,13 +26,14 @@
           for info = (service-info-from-records type instance records)
           when info collect info)))
 
-(defun browse-once (type &key (timeout 2.0) interface socket)
+(defun browse-once (type &key (timeout 2.0) interface socket (family :ipv4))
   "Query for service TYPE (e.g. \"_ipp._tcp.local\"), collect responses for
-TIMEOUT seconds, and return a list of SERVICE-INFO.  INTERFACE (a dotted IPv4
-string) picks the multicast egress interface — needed on VPN/multi-homed hosts.
-SOCKET, if given, is used instead of opening one (and is left open) — for tests."
+TIMEOUT seconds, and return a list of SERVICE-INFO.  FAMILY is :IPV4 or :IPV6.
+INTERFACE picks the multicast egress interface — a dotted-quad IPv4 string for
+:IPV4, or an interface index for :IPV6.  SOCKET, if given, is used instead of
+opening one (and is left open) — for tests."
   (let* ((own-socket (null socket))
-         (socket (or socket (make-mdns-socket :interface interface)))
+         (socket (or socket (make-mdns-socket :interface interface :family family)))
          (cache (make-cache)))
     (unwind-protect
          (progn
@@ -61,13 +62,14 @@ SOCKET, if given, is used instead of opening one (and is left open) — for test
 (defparameter +dns-sd-meta-query+ "_services._dns-sd._udp.local"
   "The DNS-SD service-type enumeration name (RFC 6763 §9).")
 
-(defun enumerate-service-types (&key (timeout 2.0) interface socket)
+(defun enumerate-service-types (&key (timeout 2.0) interface socket (family :ipv4))
   "Enumerate the DNS-SD service *types* advertised on the local link — RFC 6763
 §9's meta-query, the same thing `dns-sd -B _services._dns-sd._udp` does.  Returns a
-sorted list of type strings such as \"_http._tcp.local\".  SOCKET, if given, is
-used instead of opening one (and left open) — for tests."
+sorted list of type strings such as \"_http._tcp.local\".  FAMILY is :IPV4 or
+:IPV6.  SOCKET, if given, is used instead of opening one (and left open) — for
+tests."
   (let* ((own-socket (null socket))
-         (socket (or socket (make-mdns-socket :interface interface)))
+         (socket (or socket (make-mdns-socket :interface interface :family family)))
          (cache (make-cache)))
     (unwind-protect
          (progn
@@ -100,12 +102,13 @@ used instead of opening one (and left open) — for tests."
 first (instance) label.  \"My Printer._ipp._tcp.local\" -> \"_ipp._tcp.local\"."
   (format nil "~{~A~^.~}" (mapcar #'escape-label (rest (split-name instance)))))
 
-(defun resolve (instance &key (timeout 2.0) interface socket)
+(defun resolve (instance &key (timeout 2.0) interface socket (family :ipv4))
   "Resolve one fully-qualified service instance name (e.g.
 \"My Printer._ipp._tcp.local\") to a single SERVICE-INFO, or NIL if not found
-within TIMEOUT.  SOCKET, if given, is used instead of opening one (for tests)."
+within TIMEOUT.  FAMILY is :IPV4 or :IPV6.  SOCKET, if given, is used instead of
+opening one (for tests)."
   (let* ((own-socket (null socket))
-         (socket (or socket (make-mdns-socket :interface interface)))
+         (socket (or socket (make-mdns-socket :interface interface :family family)))
          (cache (make-cache))
          (type (instance-type instance)))
     (unwind-protect

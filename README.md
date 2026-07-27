@@ -64,19 +64,39 @@ scripts/build-cli.sh            # build ./0conf   (add --sign on macOS, see belo
 ./0conf browse _airplay._tcp    # list instances of a type (host / port / TXT)
 ./0conf monitor                 # live, self-updating view of all services (Ctrl-C to quit)
 ./0conf resolve "Front Desk._ipp._tcp.local"
-./0conf help
-
-./0conf -i 192.168.1.42 browse  # pin the multicast egress interface (browse/resolve)
+./0conf publish _http._tcp "My Widget" 8080 --txt path=/status   # advertise until Ctrl-C
+./0conf interfaces              # list usable network interfaces (pick a value for -i)
+./0conf --version | help
 ```
 
-`monitor` starts a responder (one socket per interface, so it watches every link),
-keeps a live browser per type, and redraws a grouped view as services appear,
-change, and disappear — like `dns-sd -B` / `avahi-browse -a`, but as a dashboard.
-It browses both the types the DNS-SD meta-query enumerates *and* a built-in list
-of well-known types (printers, Chromecast, HomeKit, SSH, SMB, …), since some
-devices answer a direct browse but ignore the meta-query. (On a client-isolated
-network — common at cafés — you'll still only see your own device; that's the
-access point blocking peer traffic, not the tool.)
+**Global options:** `-i/--interface <addr>` (pin the egress interface — a
+dotted-quad for IPv4, an interface index for IPv6), `--timeout <secs>`, `--json`
+(machine-readable output for every command), `--color auto|always|never` (also
+honors `NO_COLOR`), and `-6/--ipv6` / `-4/--ipv4` for `browse`/`resolve`.
+Exit codes: 0 found, 1 not-found, 2 usage error, 130 on Ctrl-C. When output is
+piped or `--json` is set, no ANSI escapes are emitted.
+
+```sh
+./0conf browse --json | jq .                 # scriptable
+./0conf -i 192.168.1.42 browse _ipp._tcp     # pin the interface
+./0conf monitor --once --timeout 5 --json    # one snapshot, then exit
+./0conf monitor --type _googlecast._tcp      # watch just one type
+```
+
+`monitor` starts a responder (one socket per interface, so it watches every link;
+pin it with `-i`), keeps a live browser per type, and redraws a grouped dashboard
+— with an age column — as services appear, change, and disappear, like `dns-sd -B`
+/ `avahi-browse -a`. It browses both the types the DNS-SD meta-query enumerates
+*and* a built-in list of well-known types (printers, Chromecast, HomeKit, SSH,
+SMB, …), since some devices answer a direct browse but ignore the meta-query.
+`--once` prints a single snapshot and exits; `--for <secs>` runs for a bounded
+time; when piped it streams `+`/`-` add/remove lines instead of a redraw. (On a
+client-isolated network — common at cafés — you'll still only see your own device;
+that's the access point blocking peer traffic, not the tool.)
+
+`publish` advertises a service (probing + conflict-renaming per RFC 6762) and
+sends a goodbye when you stop it; `--txt k=v` (repeatable), `--subtype s`,
+`--host h`, `--no-probe`.
 
 `browse` with no argument runs the DNS-SD meta-query
 (`_services._dns-sd._udp.local`, [RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9))

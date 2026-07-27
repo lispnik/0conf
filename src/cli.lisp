@@ -1,14 +1,15 @@
 ;;;; cli.lisp — a command-line front end for 0conf (system 0conf/cli).
 ;;;;
 ;;;; Sub-commands:
-;;;;   0conf browse                 list the DNS-SD service types on the LAN
-;;;;   0conf browse <type>          list instances of a type (e.g. _http._tcp)
-;;;;   0conf monitor                live, self-updating view of all services
-;;;;   0conf resolve <instance>     resolve one instance to host / port / TXT
-;;;;   0conf help                   usage
+;;;;   0conf browse [<type>]          list service types, or instances of a type
+;;;;   0conf monitor                  live, self-updating view of all services
+;;;;   0conf resolve <instance>       resolve one instance to host / port / TXT
+;;;;   0conf publish <type> <name> <port>   advertise a service until Ctrl-C
+;;;;   0conf interfaces               list usable network interfaces
+;;;;   0conf help | --version
 ;;;;
-;;;; A leading `-i <addr>` / `--interface <addr>` pins the multicast egress
-;;;; interface for the one-shot commands (browse/resolve).
+;;;; Global options: -i/--interface <addr>, --timeout <secs>, --json,
+;;;;   --color auto|always|never, -6/--ipv6, -4/--ipv4.
 ;;;;
 ;;;; Built as a standalone executable with `asdf:make :0conf/cli` (see
 ;;;; scripts/build-cli.sh).  Every command needs working multicast — on macOS a
@@ -20,13 +21,22 @@
 
 (in-package #:0conf-cli)
 
-(defparameter *program* "0conf"
-  "Name printed in usage/help — matches the built executable.")
+(defparameter *program* "0conf")
 
-(defvar *interface* nil
-  "Dotted-quad egress interface for the one-shot commands, or NIL for the default.")
+(defparameter +version+
+  (or (ignore-errors (asdf:component-version (asdf:find-system "0conf")))
+      "unknown")
+  "Resolved from the ASDF system at image-save time, so the binary needs no ASDF.")
 
 (defparameter +esc+ (code-char 27))
+
+;;; per-invocation options (bound in MAIN)
+(defvar *interface* nil)                ; egress interface (dotted-quad v4 / index v6)
+(defvar *timeout* 3.0)                  ; seconds for one-shot queries
+(defvar *family* :ipv4)                 ; :ipv4 or :ipv6
+(defvar *json* nil)                     ; machine-readable output
+(defvar *ansi* nil)                     ; may use cursor movement / redraw (a TTY)
+(defvar *color* nil)                    ; may emit color / bold
 
 (defparameter +well-known-types+
   '("_http._tcp.local" "_https._tcp.local"
@@ -41,10 +51,19 @@
     "_smb._tcp.local" "_afpovertcp._tcp.local" "_nfs._tcp.local" "_webdav._tcp.local"
     "_daap._tcp.local" "_dacp._tcp.local" "_workstation._tcp.local")
   "Common DNS-SD types the live monitor always browses, on top of whatever the
-meta-query enumerates — some devices answer a direct browse but not the type
+meta-query enumerates — some devices answer a direct browse but not the
 enumeration.  A type with no instances stays silent, so this only ever adds.")
 
-;;; --- formatting helpers ----------------------------------------------------
+;;; --- errors ----------------------------------------------------------------
+
+(define-condition cli-error (error)
+  ((message :initarg :message :reader cli-error-message))
+  (:report (lambda (c s) (write-string (cli-error-message c) s))))
+
+(defun cli-error (fmt &rest args)
+  (error 'cli-error :message (apply #'format nil fmt args)))
+
+;;; --- text helpers ----------------------------------------------------------
 
 (defun ensure-local (name)
   "Append `.local` to a bare service type / instance if the user left it off."
@@ -54,206 +73,486 @@ enumeration.  A type with no instances stays silent, so this only ever adds.")
         (concatenate 'string n ".local"))))
 
 (defun addr-string (a)
-  "Render an address record's octets as text (IPv4 or IPv6)."
   (case (length a)
     (4  (0conf:format-ipv4 a))
     (16 (0conf:format-ipv6 a))
     (t  (princ-to-string a))))
 
+(defun sanitize (string)
+  "Render STRING with control / non-printable bytes escaped as \\xNN, so a raw ESC
+in a service name or TXT value can't corrupt or inject into the terminal."
+  (with-output-to-string (o)
+    (loop for ch across string
+          for code = (char-code ch)
+          do (if (or (< code 32) (= code 127))
+                 (format o "\\x~2,'0X" code)
+                 (write-char ch o)))))
+
 (defun txt-value-string (v)
-  "A TXT value is NIL (bare key), a string, or raw octets."
+  "A TXT value is NIL (bare key), a string, or raw octets.  Returns a display
+string (sanitized) or NIL for a keyless entry."
   (cond ((null v) nil)
-        ((stringp v) v)
-        (t (map 'string #'code-char v))))
+        ((stringp v) (sanitize v))
+        (t (sanitize (map 'string #'code-char v)))))
 
 (defun host-port (info)
-  "\"host:port\" for INFO, or \"\" if its host isn't known yet."
   (let ((h (0conf:service-info-host info)))
     (if (and h (plusp (length h)))
-        (format nil "~A:~A" h (0conf:service-info-port info))
+        (format nil "~A:~A" (sanitize h) (0conf:service-info-port info))
         "")))
 
+(defun fit (s width)
+  "Truncate S to WIDTH characters with an ellipsis (keeps table columns aligned)."
+  (if (> (length s) width)
+      (concatenate 'string (subseq s 0 (1- width)) "…")
+      s))
+
+(defun hash-keys (h) (loop for k being the hash-keys of h collect k))
+
+;;; --- terminal (no-ops unless *ansi* / *color*) -----------------------------
+
+(defun bold (s) (if *color* (format nil "~C[1m~A~C[0m" +esc+ s +esc+) s))
+(defun clear-home () (when *ansi* (format t "~C[H~C[2J" +esc+ +esc+)))
+(defun hide-cursor () (when *ansi* (format t "~C[?25l" +esc+)))
+(defun show-cursor () (when *ansi* (format t "~C[?25h" +esc+)))
+
+;;; --- JSON emitter (small hand-rolled — no dependency) ----------------------
+
+(defun jstr (s)
+  "S as a JSON string literal."
+  (with-output-to-string (o)
+    (write-char #\" o)
+    (loop for ch across s for c = (char-code ch)
+          do (case ch
+               (#\" (write-string "\\\"" o))
+               (#\\ (write-string "\\\\" o))
+               (#\Newline (write-string "\\n" o))
+               (#\Return (write-string "\\r" o))
+               (#\Tab (write-string "\\t" o))
+               (t (if (< c 32) (format o "\\u~4,'0X" c) (write-char ch o)))))
+    (write-char #\" o)))
+
+(defun txt-json (alist)
+  (format nil "{~{~A~^,~}}"
+          (loop for (k . v) in alist
+                for vs = (let ((s (txt-value-string v))) (if s (jstr s) "null"))
+                collect (format nil "~A:~A" (jstr k) vs))))
+
+(defun service-json (info)
+  (format nil "{~A:~A,~A:~A,~A:~A,~A:~D,~A:[~{~A~^,~}],~A:~A}"
+          (jstr "name") (jstr (0conf:service-info-name info))
+          (jstr "type") (jstr (0conf:service-info-type info))
+          (jstr "host") (jstr (or (0conf:service-info-host info) ""))
+          (jstr "port") (0conf:service-info-port info)
+          (jstr "addresses") (mapcar (lambda (a) (jstr (addr-string a)))
+                                     (0conf:service-info-addresses info))
+          (jstr "txt") (txt-json (0conf:service-info-txt info))))
+
+(defun services-json (infos)
+  (format nil "[~{~A~^,~}]" (mapcar #'service-json infos)))
+
+;;; --- human printing --------------------------------------------------------
+
 (defun print-service (info &optional (stream *standard-output*))
-  "Print one SERVICE-INFO: name, host:port, addresses, and TXT key/values."
-  (format stream "  ~A~%" (0conf:service-info-name info))
+  (format stream "  ~A~%" (sanitize (0conf:service-info-name info)))
   (let ((hp (host-port info)))
     (when (plusp (length hp)) (format stream "      at   ~A~%" hp)))
   (dolist (a (0conf:service-info-addresses info))
     (format stream "      addr ~A~%" (addr-string a)))
   (loop for (k . v) in (0conf:service-info-txt info)
         for vs = (txt-value-string v)
-        do (format stream "      txt  ~A~@[=~A~]~%" k vs)))
+        do (format stream "      txt  ~A~@[=~A~]~%" (sanitize k) vs)))
+
+;;; --- interface arg conversion (v6 wants an index) --------------------------
+
+(defun iface-arg ()
+  (cond ((null *interface*) nil)
+        ((eq *family* :ipv6)
+         (or (ignore-errors (parse-integer *interface*))
+             (cli-error "with -6, --interface must be an interface index (see `~A interfaces`)"
+                        *program*)))
+        (t *interface*)))
 
 ;;; --- browse / resolve (one-shot) -------------------------------------------
 
-(defun browse-types (&key (timeout 3.0))
-  (let ((types (0conf:enumerate-service-types :timeout timeout :interface *interface*)))
+(defun browse-types ()
+  (let ((types (0conf:enumerate-service-types :timeout *timeout*
+                                              :interface (iface-arg) :family *family*)))
     (cond
+      (*json* (format t "[~{~A~^,~}]~%" (mapcar #'jstr types)) (if types 0 1))
       (types
        (format t "~&Service types on the local network:~%~%")
        (dolist (ty types) (format t "  ~A~%" ty))
        (format t "~%~D type~:P.  See instances with: ~A browse <type>~%"
-               (length types) *program*))
+               (length types) *program*)
+       0)
       (t
        (format t "~&No service types found.~%~
                   Nothing is advertising, or multicast isn't reaching the LAN ~
                   (on macOS a raw binary needs Local Network access —~%~
-                  see doc/macos-multicast.md).~%")))
-    0))
+                  see doc/macos-multicast.md).~%")
+       1))))
 
-(defun browse-instances (type &key (timeout 3.0))
-  (let ((infos (sort (copy-list (0conf:browse-once type :timeout timeout :interface *interface*))
+(defun browse-instances (type)
+  (let ((infos (sort (copy-list (0conf:browse-once type :timeout *timeout*
+                                                   :interface (iface-arg) :family *family*))
                      #'string-lessp :key #'0conf:service-info-name)))
     (cond
+      (*json* (format t "~A~%" (services-json infos)) (if infos 0 1))
       (infos
        (format t "~&~D instance~:P of ~A:~%~%" (length infos) type)
-       (dolist (i infos) (print-service i) (terpri)))
-      (t (format t "~&No instances of ~A found.~%" type)))
-    0))
+       (dolist (i infos) (print-service i) (terpri))
+       0)
+      (t (format t "~&No instances of ~A found.~%" type) 1))))
 
-(defun cmd-browse (args)
-  (let ((type (first args)))
+(defun cmd-browse (pos)
+  (let ((type (first pos)))
     (if (and type (plusp (length type)))
         (browse-instances (ensure-local type))
         (browse-types))))
 
-(defun cmd-resolve (args)
-  (let ((instance (first args)))
+(defun cmd-resolve (pos)
+  (let ((instance (first pos)))
+    (when (null instance)
+      (cli-error "usage: ~A resolve <instance._type._tcp.local>" *program*))
+    (let* ((fq (ensure-local instance))
+           (info (0conf:resolve fq :timeout *timeout* :interface (iface-arg) :family *family*)))
+      (cond
+        (*json* (format t "~A~%" (if info (service-json info) "null")) (if info 0 1))
+        (info (format t "~&~A~%" fq) (print-service info) 0)
+        (t (format t "~&Not found: ~A~%" fq) 1)))))
+
+;;; --- interfaces ------------------------------------------------------------
+
+(defun interface-json (nif)
+  (format nil "{~A:~A,~A:~A,~A:~A,~A:~A}"
+          (jstr "name") (jstr (0conf:net-interface-name nif))
+          (jstr "index") (or (0conf:net-interface-index nif) "null")
+          (jstr "ipv4") (let ((v4 (0conf:net-interface-ipv4 nif)))
+                          (if v4 (jstr (0conf:format-ipv4 v4)) "null"))
+          (jstr "has_v6") (if (0conf:net-interface-has-v6 nif) "true" "false")))
+
+(defun cmd-interfaces (opts)
+  (let* ((all (gethash "all" opts))
+         (ifs (0conf:list-interfaces :include-loopback (and all t)
+                                     :multicast-only (not all))))
     (cond
-      ((null instance)
-       (format *error-output* "usage: ~A resolve <instance._type._tcp.local>~%" *program*)
-       2)
-      (t (let* ((fq (ensure-local instance))
-                (info (0conf:resolve fq :interface *interface*)))
-           (cond (info (format t "~&~A~%" fq) (print-service info) 0)
-                 (t (format t "~&Not found: ~A~%" fq) 1)))))))
+      (*json* (format t "[~{~A~^,~}]~%" (mapcar #'interface-json ifs)) 0)
+      (t (format t "~&~8A ~6A ~16A ~A~%" "NAME" "INDEX" "IPV4" "IPV6")
+         (dolist (nif ifs)
+           (format t "~8A ~6A ~16A ~A~%"
+                   (0conf:net-interface-name nif)
+                   (or (0conf:net-interface-index nif) "-")
+                   (let ((v4 (0conf:net-interface-ipv4 nif)))
+                     (if v4 (0conf:format-ipv4 v4) "-"))
+                   (if (0conf:net-interface-has-v6 nif) "yes" "-")))
+         0))))
+
+;;; --- publish ---------------------------------------------------------------
+
+(defun parse-txt (kvs)
+  "A list of \"k=v\" / bare \"k\" strings -> the alist MAKE-SERVICE-INFO wants."
+  (mapcar (lambda (kv)
+            (let ((eq (position #\= kv)))
+              (if eq (cons (subseq kv 0 eq) (subseq kv (1+ eq))) (cons kv nil))))
+          kvs))
+
+(defun cmd-publish (pos opts)
+  (destructuring-bind (&optional type name port &rest ignore) pos
+    (declare (ignore ignore))
+    (unless (and type name port)
+      (cli-error "usage: ~A publish <type> <name> <port> [--txt k=v]... [--subtype s]..." *program*))
+    (let ((port-n (or (ignore-errors (parse-integer port))
+                      (cli-error "port must be a number: ~A" port)))
+          (info nil)
+          (responder (0conf:make-responder)))
+      (setf info (0conf:make-service-info
+                  :type (ensure-local type) :name name :port port-n
+                  :txt (parse-txt (reverse (gethash "txt" opts)))
+                  :subtypes (reverse (gethash "subtype" opts))
+                  :host (or (gethash "host" opts) (0conf:default-host-name))))
+      (unwind-protect
+           (progn
+             (0conf:start-responder
+              responder
+              :socket (and *interface* (0conf:make-mdns-socket :interface *interface* :family *family*)))
+             (0conf:register-service responder info :probe (not (gethash "no-probe" opts)))
+             (if *json*
+                 (format t "~A~%" (service-json info))
+                 (format t "~&Publishing ~A~%  type ~A  port ~D~@[  host ~A~]~%  (Ctrl-C to stop)~%"
+                         (sanitize (0conf:service-instance-name info))
+                         (0conf:service-info-type info) port-n
+                         (0conf:service-info-host info)))
+             (finish-output)
+             (handler-case (loop (sleep 1))
+               (sb-sys:interactive-interrupt () nil)))
+        (ignore-errors (0conf:unregister-service responder info))    ; goodbye
+        (ignore-errors (0conf:stop-responder responder))
+        (unless *json* (format t "~&Stopped.~%")))
+      0)))
 
 ;;; --- monitor (live view) ---------------------------------------------------
-;;;
-;;; Starts a responder (one socket per interface, so it watches every link),
-;;; enumerates the service types, and keeps a live browser per type.  A shared
-;;; table of instances is redrawn as services appear, change, and disappear.
 
-(defun render-monitor (infos)
-  (let ((by-type (make-hash-table :test 'equal)))
-    (dolist (i infos)
-      (push i (gethash (0conf:service-info-type i) by-type)))
-    (format t "~C[H~C[2J" +esc+ +esc+)                 ; home + clear
+(defstruct seen info first last)        ; a discovered instance + first/last time
+
+(defun age-string (e now)
+  (let ((secs (max 0 (round (/ (- now (seen-first e)) internal-time-units-per-second)))))
+    (cond ((< secs 60) (format nil "~Ds" secs))
+          ((< secs 3600) (format nil "~Dm" (floor secs 60)))
+          (t (format nil "~Dh" (floor secs 3600))))))
+
+(defun render-dashboard (seens)
+  (let ((by-type (make-hash-table :test 'equal))
+        (now (get-internal-real-time)))
+    (dolist (e seens) (push e (gethash (0conf:service-info-type (seen-info e)) by-type)))
+    (clear-home)
     (format t "~A monitor — ~D service~:P across ~D type~:P   (Ctrl-C to quit)~2%"
-            *program* (length infos) (hash-table-count by-type))
-    (if (null infos)
-        (format t "  discovering services on the local network…~%")
-        (dolist (ty (sort (loop for k being the hash-keys of by-type collect k) #'string<))
-          (format t "~C[1m~A~C[0m~%" +esc+ ty +esc+)   ; bold type header
-          (dolist (i (sort (copy-list (gethash ty by-type))
-                           #'string-lessp :key #'0conf:service-info-name))
-            (format t "    ~30A ~A~%" (0conf:service-info-name i) (host-port i)))
+            *program* (length seens) (hash-table-count by-type))
+    (if (null seens)
+        (format t "  discovering services…~%")
+        (dolist (ty (sort (hash-keys by-type) #'string<))
+          (format t "~A~%" (bold ty))
+          (dolist (e (sort (copy-list (gethash ty by-type)) #'string-lessp
+                           :key (lambda (e) (0conf:service-info-name (seen-info e)))))
+            (format t "    ~30A ~22A ~A~%"
+                    (fit (sanitize (0conf:service-info-name (seen-info e))) 30)
+                    (host-port (seen-info e))
+                    (age-string e now)))
           (terpri)))
     (finish-output)))
 
-(defun cmd-monitor (args)
-  (declare (ignore args))
-  (let ((responder (0conf:start-responder (0conf:make-responder)))
-        (services (make-hash-table :test 'equal))     ; instance name -> service-info
-        (browsers (make-hash-table :test 'equal))     ; type -> service-browser
-        (lock (bordeaux-threads:make-lock "monitor"))
-        (running t)
-        (type-thread nil))
-    (labels ((put (i) (bordeaux-threads:with-lock-held (lock)
-                        (setf (gethash (0conf:service-instance-name i) services) i)))
-             (del (n) (bordeaux-threads:with-lock-held (lock)
-                        (remhash n services)))
+(defun output-snapshot (seens)
+  (let ((infos (mapcar #'seen-info seens)))
+    (cond
+      (*json* (format t "~A~%" (services-json infos)))
+      (infos (format t "~&~D service~:P:~2%" (length infos))
+             (dolist (i (sort (copy-list infos) #'string-lessp :key #'0conf:service-info-name))
+               (print-service i) (terpri)))
+      (t (format t "~&No services found.~%")))
+    (finish-output)))
+
+(defun log-event (sign info-or-name)
+  "Streaming +/- line for the non-TTY monitor."
+  (if (stringp info-or-name)
+      (format t "~C ~A~%" sign (sanitize info-or-name))
+      (format t "~C ~A  ~A  ~A~%" sign (0conf:service-info-type info-or-name)
+              (sanitize (0conf:service-info-name info-or-name)) (host-port info-or-name)))
+  (finish-output))
+
+(defun cmd-monitor (opts)
+  (let* ((once (gethash "once" opts))
+         (for-secs (let ((f (gethash "for" opts)))
+                     (and f (or (ignore-errors (float (read-from-string f)))
+                                (cli-error "--for needs a number of seconds")))))
+         (type-filter (let ((tf (gethash "type" opts))) (and tf (ensure-local tf))))
+         (mode (cond ((or once *json*) :once) (*ansi* :dashboard) (t :stream)))
+         (responder (0conf:make-responder))
+         (services (make-hash-table :test 'equal))
+         (browsers (make-hash-table :test 'equal))
+         (lock (bordeaux-threads:make-lock "monitor"))
+         (running t)
+         (start (get-internal-real-time))
+         (deadline (and for-secs (+ start (round (* for-secs internal-time-units-per-second)))))
+         (once-deadline (and (eq mode :once)
+                             (+ start (round (* *timeout* internal-time-units-per-second))))))
+    (labels ((put (i)
+               (let ((name (0conf:service-instance-name i)) (now (get-internal-real-time)))
+                 (bordeaux-threads:with-lock-held (lock)
+                   (let ((e (gethash name services)))
+                     (cond (e (setf (seen-info e) i (seen-last e) now))
+                           (t (setf (gethash name services) (make-seen :info i :first now :last now))
+                              (when (eq mode :stream) (log-event #\+ i))))))))
+             (del (n)
+               (bordeaux-threads:with-lock-held (lock)
+                 (when (and (eq mode :stream) (gethash n services)) (log-event #\- n))
+                 (remhash n services)))
              (ensure-browser (ty)
                (bordeaux-threads:with-lock-held (lock)
                  (unless (gethash ty browsers)
                    (setf (gethash ty browsers)
                          (0conf:browse-services responder ty
-                                                :on-add    #'put
-                                                :on-update #'put
-                                                :on-remove #'del)))))
+                                                :on-add #'put :on-update #'put :on-remove #'del)))))
              (snapshot ()
                (bordeaux-threads:with-lock-held (lock)
-                 (loop for i being the hash-values of services collect i))))
+                 (loop for e being the hash-values of services collect e)))
+             (expired-p ()
+               (or (not running)
+                   (and deadline (>= (get-internal-real-time) deadline))
+                   (and once-deadline (>= (get-internal-real-time) once-deadline))))
+             (nap (secs)
+               (loop repeat (max 1 (round (/ secs 0.2)))
+                     while (not (expired-p)) do (sleep 0.2))))
       (unwind-protect
            (progn
-             (format t "~C[?25l" +esc+)                ; hide cursor
-             (format t "~C[H~C[2J  discovering services…~%" +esc+ +esc+)
-             (finish-output)
-             ;; always sweep the well-known types (some devices answer a direct
-             ;; browse but ignore the meta-query)
-             (dolist (ty +well-known-types+) (ensure-browser ty))
-             ;; ...and keep discovering any *other* types the network advertises
-             (setf type-thread
+             (0conf:start-responder
+              responder
+              :socket (and *interface* (0conf:make-mdns-socket :interface *interface* :family *family*)))
+             (when (eq mode :dashboard) (hide-cursor) (clear-home))
+             ;; seed browsers
+             (if type-filter
+                 (ensure-browser type-filter)
+                 (progn
+                   (dolist (ty +well-known-types+) (ensure-browser ty))
                    (bordeaux-threads:make-thread
                     (lambda ()
                       (loop while running do
                         (dolist (ty (ignore-errors
-                                     (0conf:enumerate-service-types :timeout 2.0)))
+                                     (0conf:enumerate-service-types :timeout 1.5)))
                           (ensure-browser ty))
-                        (sleep 4)))
-                    :name "0conf-type-poll"))
-             ;; redraw on the main thread until Ctrl-C
+                        (loop repeat 16 while running do (sleep 0.25))))
+                    :name "0conf-type-poll")))
+             ;; run
              (handler-case
-                 (loop while running do
-                   (render-monitor (snapshot))
-                   (sleep 1.0))
-               (sb-sys:interactive-interrupt () nil)))
+                 (ecase mode
+                   (:once (nap most-positive-fixnum)          ; until once-deadline
+                          (output-snapshot (snapshot)))
+                   (:dashboard (loop until (expired-p)
+                                     do (render-dashboard (snapshot)) (nap 1.0)))
+                   (:stream (loop until (expired-p) do (nap 0.3))))
+               (sb-sys:interactive-interrupt ()
+                 (setf running nil)
+                 (when (eq mode :once) (output-snapshot (snapshot))))))
+        ;; Fast teardown: signal the poll thread, stop the responder (which
+        ;; releases the socket and stops answering), and restore the cursor.  We
+        ;; deliberately do NOT join the dozens of per-type browser threads — that
+        ;; would take tens of seconds; TOPLEVEL's `:abort t` reaps them at exit.
         (setf running nil)
-        (when type-thread (ignore-errors (bordeaux-threads:join-thread type-thread)))
-        (bordeaux-threads:with-lock-held (lock)
-          (maphash (lambda (ty b) (declare (ignore ty)) (ignore-errors (0conf:stop-browse b)))
-                   browsers))
         (ignore-errors (0conf:stop-responder responder))
-        (format t "~C[?25h~%" +esc+))))                ; show cursor
+        (when (eq mode :dashboard) (show-cursor) (terpri)))))
   0)
 
-;;; --- dispatch --------------------------------------------------------------
+;;; --- option parsing --------------------------------------------------------
 
-(defun extract-interface (argv)
-  "Pull a `-i <addr>` / `--interface <addr>` / `--interface=<addr>` option out of
-ARGV.  Returns (values interface remaining-args)."
-  (let ((iface nil) (out '()) (rest argv))
+(defparameter +flag-specs+
+  '(("--json" . :bool) ("--all" . :bool) ("--once" . :bool) ("--no-probe" . :bool)
+    ("--version" . :bool) ("-V" . :bool) ("--help" . :bool) ("-h" . :bool)
+    ("-6" . :bool) ("--ipv6" . :bool) ("-4" . :bool) ("--ipv4" . :bool)
+    ("-i" . :value) ("--interface" . :value) ("--timeout" . :value)
+    ("--for" . :value) ("--type" . :value) ("--host" . :value) ("--color" . :value)
+    ("--txt" . :repeat) ("--subtype" . :repeat)))
+
+(defun canonical (flag)
+  (cond ((member flag '("-6" "--ipv6") :test #'string=) "ipv6")
+        ((member flag '("-4" "--ipv4") :test #'string=) "ipv4")
+        ((member flag '("-i" "--interface") :test #'string=) "interface")
+        ((member flag '("-V" "--version") :test #'string=) "version")
+        ((member flag '("-h" "--help") :test #'string=) "help")
+        (t (string-left-trim "-" flag))))
+
+(defun flag-value (name inline rest)
+  "The value for a :value/:repeat flag NAME: its inline part or the next token.
+Errors if missing or itself option-shaped."
+  (let ((v (or inline (and rest (first rest)))))
+    (when (or (null v) (zerop (length v))
+              (and (null inline) (> (length v) 0) (char= (char v 0) #\-)))
+      (cli-error "option ~A needs a value" name))
+    v))
+
+(defun parse-args (argv)
+  "Returns (values positionals opts).  OPTS maps a canonical flag name to T, a
+value string, or (for repeats) a list.  Signals CLI-ERROR on bad usage."
+  (let ((opts (make-hash-table :test 'equal))
+        (pos '())
+        (no-more nil)
+        (rest argv))
     (loop while rest
-          for a = (pop rest)
+          for tok = (pop rest)
           do (cond
-               ((and (member a '("-i" "--interface") :test #'string=) rest)
-                (setf iface (pop rest)))
-               ((and (> (length a) 12) (string= "--interface=" (subseq a 0 12)))
-                (setf iface (subseq a 12)))
-               (t (push a out))))
-    (values iface (nreverse out))))
+               (no-more (push tok pos))
+               ((string= tok "--") (setf no-more t))
+               ((and (> (length tok) 1) (char= (char tok 0) #\-))
+                (let* ((eq (position #\= tok))
+                       (name (if eq (subseq tok 0 eq) tok))
+                       (inline (and eq (subseq tok (1+ eq))))
+                       (spec (cdr (assoc name +flag-specs+ :test #'string=))))
+                  (unless spec (cli-error "unknown option ~A" name))
+                  (ecase spec
+                    (:bool (when inline (cli-error "option ~A takes no value" name))
+                           (setf (gethash (canonical name) opts) t))
+                    (:value (setf (gethash (canonical name) opts) (flag-value name inline rest))
+                            (unless inline (pop rest)))
+                    (:repeat (push (flag-value name inline rest) (gethash (canonical name) opts))
+                             (unless inline (pop rest))))))
+               (t (push tok pos))))
+    (values (nreverse pos) opts)))
+
+(defun compute-terminal (opts)
+  "Set *ANSI* / *COLOR* from --color, NO_COLOR, --json, and whether stdout is a TTY."
+  (let* ((mode (let ((c (gethash "color" opts)))
+                 (cond ((null c) :auto)
+                       ((string= c "always") :always)
+                       ((string= c "never") :never)
+                       ((string= c "auto") :auto)
+                       (t (cli-error "--color must be auto, always, or never")))))
+         (tty (interactive-stream-p *standard-output*))
+         (want (case mode (:always t) (:never nil) (:auto tty))))
+    (setf *ansi* (and want (not *json*))
+          *color* (and *ansi* (or (eq mode :always) (not (sb-ext:posix-getenv "NO_COLOR")))))))
+
+;;; --- usage / dispatch ------------------------------------------------------
 
 (defun usage (&optional (stream *standard-output*))
-  (format stream "~&~A — browse and resolve mDNS / DNS-SD services on the local network.~2%~
+  (format stream "~&~A ~A — browse, resolve, monitor, and publish mDNS / DNS-SD ~
+                  services on the local network.~2%~
                   Usage:~%~
-                  ~2T~A browse              list the service types on the LAN~%~
-                  ~2T~A browse <type>       list instances of a type (e.g. _http._tcp)~%~
-                  ~2T~A monitor             live, self-updating view of all services~%~
-                  ~2T~A resolve <instance>  resolve one instance to host / port / TXT~%~
-                  ~2T~A help                show this help~2%~
+                  ~2T~A browse [<type>]            list service types, or instances of a type~%~
+                  ~2T~A monitor                    live view of all services (--once, --for S, --type T)~%~
+                  ~2T~A resolve <instance>         resolve one instance to host / port / TXT~%~
+                  ~2T~A publish <type> <name> <port>   advertise a service until Ctrl-C~%~
+                  ~2T~A interfaces                 list usable network interfaces~%~
+                  ~2T~A help | --version~2%~
                   Options:~%~
-                  ~2T-i, --interface <addr>  pin the multicast egress interface ~
-                  (browse/resolve)~%"
+                  ~2T-i, --interface <addr>   pin the egress interface (v4 dotted-quad, v6 index)~%~
+                  ~2T--timeout <secs>         query window for browse/resolve/monitor --once~%~
+                  ~2T--json                   machine-readable output~%~
+                  ~2T--color auto|always|never~%~
+                  ~2T-6/--ipv6, -4/--ipv4     address family for browse/resolve~%~
+                  ~2T--txt k=v, --subtype s   (publish)   --all (interfaces)~%"
+          *program* +version+
           *program* *program* *program* *program* *program* *program*))
 
+(defun dispatch (cmd pos opts)
+  (cond
+    ((string= cmd "browse")     (cmd-browse pos))
+    ((string= cmd "monitor")    (cmd-monitor opts))
+    ((string= cmd "resolve")    (cmd-resolve pos))
+    ((string= cmd "publish")    (cmd-publish pos opts))
+    ((string= cmd "interfaces") (cmd-interfaces opts))
+    ((string= cmd "help")       (usage) 0)
+    (t (format *error-output* "~&~A: unknown command ~S~%~%" *program* cmd)
+       (usage *error-output*)
+       2)))
+
 (defun main (&optional (argv (rest sb-ext:*posix-argv*)))
-  "Dispatch a sub-command.  Returns a Unix exit code."
-  (multiple-value-bind (iface rest) (extract-interface argv)
-    (let ((*interface* iface)
-          (cmd (first rest))
-          (args (rest rest)))
-      (cond
-        ((null cmd) (usage) 1)
-        ((string= cmd "browse") (cmd-browse args))
-        ((string= cmd "monitor") (cmd-monitor args))
-        ((string= cmd "resolve") (cmd-resolve args))
-        ((member cmd '("help" "-h" "--help") :test #'string=) (usage) 0)
-        (t (format *error-output* "~&~A: unknown command ~S~%~%" *program* cmd)
-           (usage *error-output*)
-           2)))))
+  "Parse ARGV, bind the global options, and dispatch.  Returns a Unix exit code."
+  (handler-case
+      (multiple-value-bind (pos opts) (parse-args argv)
+        (cond
+          ((gethash "version" opts) (format t "~A ~A~%" *program* +version+) 0)
+          ((gethash "help" opts) (usage) 0)
+          ((null (first pos)) (usage *error-output*) 2)
+          (t (let ((*json* (and (gethash "json" opts) t))
+                   (*interface* (gethash "interface" opts))
+                   (*family* (if (gethash "ipv6" opts) :ipv6 :ipv4))
+                   (*timeout* (let ((ts (gethash "timeout" opts)))
+                                (if ts
+                                    (or (ignore-errors (float (read-from-string ts)))
+                                        (cli-error "--timeout needs a number of seconds"))
+                                    3.0))))
+               (compute-terminal opts)
+               (dispatch (first pos) (rest pos) opts)))))
+    (cli-error (e)
+      (format *error-output* "~&~A: ~A~%" *program* e)
+      2)))
 
 (defun toplevel ()
-  "Executable entry point: run MAIN, print any error, and exit with its code."
-  (sb-ext:exit
-   :code (handler-case (or (main) 0)
-           (error (e) (format *error-output* "~&~A: ~A~%" *program* e) 1))))
+  "Executable entry point: run MAIN, flush, and hard-exit with its code (130 on
+Ctrl-C).  :ABORT T exits immediately rather than waiting on lingering responder /
+browser threads (which a graceful exit would join); we flush first so no output
+is lost."
+  (let ((code (handler-case (or (main) 0)
+                (sb-sys:interactive-interrupt () 130)
+                (error (e) (format *error-output* "~&~A: ~A~%" *program* e) 1))))
+    (ignore-errors (finish-output *standard-output*))
+    (ignore-errors (finish-output *error-output*))
+    (sb-ext:exit :code code :abort t)))
