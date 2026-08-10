@@ -69,8 +69,9 @@ scripts/build-cli.sh            # build ./0conf   (add --sign on macOS, see belo
 ./0conf --version | help
 ```
 
-**Global options:** `-i/--interface <addr>` (pin the egress interface — a
-dotted-quad for IPv4, an interface index for IPv6), `--timeout <secs>`, `--json`
+**Global options:** `-i/--interface <if>` (pin the egress interface — a NIC name
+like `en0`, or the raw form: a dotted-quad for IPv4, an interface index for
+IPv6), `--timeout <secs>`, `--json`
 (machine-readable output for every command), `--color auto|always|never` (also
 honors `NO_COLOR`), and `-6/--ipv6` / `-4/--ipv4` for `browse`/`resolve`.
 Exit codes: 0 found, 1 not-found, 2 usage error, 130 on Ctrl-C. When output is
@@ -78,7 +79,7 @@ piped or `--json` is set, no ANSI escapes are emitted.
 
 ```sh
 ./0conf browse --json | jq .                 # scriptable
-./0conf -i 192.168.1.42 browse _ipp._tcp     # pin the interface
+./0conf -i en0 browse _ipp._tcp              # pin the interface (or -i 192.168.1.42)
 ./0conf monitor --once --timeout 5 --json    # one snapshot, then exit
 ./0conf monitor --type _googlecast._tcp      # watch just one type
 ```

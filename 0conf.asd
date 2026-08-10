@@ -34,7 +34,7 @@
 
 (defsystem "0conf/test"
   :description "FiveAM test suite for 0conf."
-  :depends-on ("0conf" "fiveam")
+  :depends-on ("0conf" "0conf/cli" "fiveam")
   :serial t
   :pathname "test"
   :components ((:file "package")
@@ -46,6 +46,7 @@
                (:file "browser-tests")
                (:file "transport-tests")
                (:file "integration-tests")
-               (:file "interop-tests"))
+               (:file "interop-tests")
+               (:file "cli-tests"))
   :perform (test-op (o c)
              (uiop:symbol-call :0conf/test '#:run-tests)))

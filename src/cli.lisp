@@ -8,7 +8,7 @@
 ;;;;   0conf interfaces               list usable network interfaces
 ;;;;   0conf help | --version
 ;;;;
-;;;; Global options: -i/--interface <addr>, --timeout <secs>, --json,
+;;;; Global options: -i/--interface <name|addr|index>, --timeout <secs>, --json,
 ;;;;   --color auto|always|never, -6/--ipv6, -4/--ipv4.
 ;;;;
 ;;;; Built as a standalone executable with `asdf:make :0conf/cli` (see
@@ -31,7 +31,7 @@
 (defparameter +esc+ (code-char 27))
 
 ;;; per-invocation options (bound in MAIN)
-(defvar *interface* nil)                ; egress interface (dotted-quad v4 / index v6)
+(defvar *interface* nil)                ; egress interface as typed (name / v4 dotted-quad / v6 index)
 (defvar *timeout* 3.0)                  ; seconds for one-shot queries
 (defvar *family* :ipv4)                 ; :ipv4 or :ipv6
 (defvar *json* nil)                     ; machine-readable output
@@ -163,15 +163,48 @@ string (sanitized) or NIL for a keyless entry."
         for vs = (txt-value-string v)
         do (format stream "      txt  ~A~@[=~A~]~%" (sanitize k) vs)))
 
-;;; --- interface arg conversion (v6 wants an index) --------------------------
+;;; --- interface arg conversion ----------------------------------------------
+;;;
+;;; -i accepts a NIC name ("en0", "utun3") in either family, plus the raw form
+;;; the socket layer wants: a dotted-quad for IPv4, an interface index for IPv6.
+;;; Names are resolved against getifaddrs(3), so an unknown one fails here with
+;;; the list of candidates rather than deep inside a setsockopt.
+
+(defun known-interfaces ()
+  "Every interface the OS reports, not just the multicast-capable ones — pinning
+to something odd is the user's call, and a narrower list makes a valid name look
+unknown."
+  (0conf:list-interfaces :include-loopback t :multicast-only nil))
+
+(defun interface-hint (ifs)
+  (format nil "known interfaces: ~{~A~^, ~} (see `~A interfaces`)"
+          (mapcar #'0conf:net-interface-name ifs) *program*))
+
+(defun find-interface (name ifs)
+  (or (find name ifs :key #'0conf:net-interface-name :test #'string=)
+      (cli-error "unknown interface ~A — ~A" name (interface-hint ifs))))
 
 (defun iface-arg ()
-  (cond ((null *interface*) nil)
-        ((eq *family* :ipv6)
-         (or (ignore-errors (parse-integer *interface*))
-             (cli-error "with -6, --interface must be an interface index (see `~A interfaces`)"
-                        *program*)))
-        (t *interface*)))
+  "*INTERFACE* in the form MAKE-MDNS-SOCKET wants for the current family: an
+IPv4 dotted-quad string, or an IPv6 interface index."
+  (cond
+    ((null *interface*) nil)
+    ((eq *family* :ipv6)
+     (or (ignore-errors (parse-integer *interface*))
+         (let* ((ifs (known-interfaces))
+                (nif (find-interface *interface* ifs)))
+           (or (0conf:net-interface-index nif)
+               (cli-error "interface ~A has no index — ~A" *interface* (interface-hint ifs))))))
+    ((ignore-errors (0conf:parse-ipv4 *interface*)) *interface*)
+    ;; digits and dots and still not parseable: meant as an address, not a name
+    ((every (lambda (c) (or (digit-char-p c) (char= c #\.))) *interface*)
+     (cli-error "not a valid IPv4 address: ~A" *interface*))
+    (t (let* ((ifs (known-interfaces))
+              (nif (find-interface *interface* ifs)))
+         (or (and (0conf:net-interface-ipv4 nif)
+                  (0conf:format-ipv4 (0conf:net-interface-ipv4 nif)))
+             (cli-error "interface ~A has no IPv4 address (try -6, or pass a dotted-quad)"
+                        *interface*))))))
 
 ;;; --- browse / resolve (one-shot) -------------------------------------------
 
@@ -275,7 +308,7 @@ string (sanitized) or NIL for a keyless entry."
            (progn
              (0conf:start-responder
               responder
-              :socket (and *interface* (0conf:make-mdns-socket :interface *interface* :family *family*)))
+              :socket (and *interface* (0conf:make-mdns-socket :interface (iface-arg) :family *family*)))
              (0conf:register-service responder info :probe (not (gethash "no-probe" opts)))
              (if *json*
                  (format t "~A~%" (service-json info))
@@ -386,7 +419,7 @@ string (sanitized) or NIL for a keyless entry."
            (progn
              (0conf:start-responder
               responder
-              :socket (and *interface* (0conf:make-mdns-socket :interface *interface* :family *family*)))
+              :socket (and *interface* (0conf:make-mdns-socket :interface (iface-arg) :family *family*)))
              (when (eq mode :dashboard) (hide-cursor) (clear-home))
              ;; seed browsers
              (if type-filter
@@ -502,7 +535,8 @@ value string, or (for repeats) a list.  Signals CLI-ERROR on bad usage."
                   ~2T~A interfaces                 list usable network interfaces~%~
                   ~2T~A help | --version~2%~
                   Options:~%~
-                  ~2T-i, --interface <addr>   pin the egress interface (v4 dotted-quad, v6 index)~%~
+                  ~2T-i, --interface <if>     pin the egress interface: a name (en0), a v4~%~
+                  ~2T                         dotted-quad, or a v6 index~%~
                   ~2T--timeout <secs>         query window for browse/resolve/monitor --once~%~
                   ~2T--json                   machine-readable output~%~
                   ~2T--color auto|always|never~%~
