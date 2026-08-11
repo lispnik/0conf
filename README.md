@@ -148,6 +148,10 @@ ocicl install cl-coveralls
 COVERALLS=1 sbcl --non-interactive --load scripts/coveralls.lisp
 ```
 
+The badge reads lower than the table above it: Coveralls scores *lines*, while
+`sb-cover` — and so `coverage-summary.py` — scores *expressions*, of which a
+line can hold several.
+
 Outside CI that is a dry run — it prints the JSON payload instead of uploading.
 CI uploads from the Linux job, authenticating with the `COVERALLS_REPO_TOKEN`
 repository secret; the step no-ops when the secret is unavailable, as on a pull
