@@ -1,6 +1,7 @@
 # 0conf
 
 [![CI](https://github.com/lispnik/0conf/actions/workflows/ci.yml/badge.svg)](https://github.com/lispnik/0conf/actions/workflows/ci.yml)
+[![Coverage Status](https://coveralls.io/repos/github/lispnik/0conf/badge.svg?branch=master)](https://coveralls.io/github/lispnik/0conf?branch=master)
 
 A pure Common Lisp implementation of **mDNS** ([RFC 6762](https://www.rfc-editor.org/rfc/rfc6762))
 and **DNS-SD** ([RFC 6763](https://www.rfc-editor.org/rfc/rfc6763)) — "zeroconf"
@@ -124,17 +125,33 @@ CI tangles and runs it on every push, so the tutorial can't drift from working c
 ## Coverage
 
 CI generates an [`sb-cover`](http://www.sbcl.org/manual/#sb_002dcover) report each
-run: a per-file table is posted to the run summary and the full HTML is uploaded
-as the `coverage-html` artifact. Reproduce locally:
+run: a per-file table is posted to the run summary, the full HTML is uploaded as
+the `coverage-html` artifact, and the numbers are pushed to
+[Coveralls](https://coveralls.io/github/lispnik/0conf). Reproduce locally:
 
 ```sh
 sbcl --non-interactive --load scripts/coverage.lisp   # writes coverage/cover-index.html
 python3 scripts/coverage-summary.py                   # prints the summary table
 ```
 
-The library sources sit around ~84% of expressions; the untested remainder is
+The library proper sits around ~87% of expressions (`octets` 98%, `browser` 94%,
+`records` 93%, `service-info` 92%, `transport` 86%); the untested remainder is
 mostly the live multicast send/join paths (no multicast fabric in CI) and pure
-declaration files.
+declaration files. Counting `src/cli.lisp` — barely tested, and mostly terminal
+I/O — the whole tree is ~65%.
+
+To post to Coveralls yourself you need `cl-coveralls`, which is deliberately
+kept out of `ocicl.csv` (it pulls ~70 systems that only this path wants):
+
+```sh
+ocicl install cl-coveralls
+COVERALLS=1 sbcl --non-interactive --load scripts/coveralls.lisp
+```
+
+Outside CI that is a dry run — it prints the JSON payload instead of uploading.
+CI uploads from the Linux job, authenticating with the `COVERALLS_REPO_TOKEN`
+repository secret; the step no-ops when the secret is unavailable, as on a pull
+request from a fork.
 
 ## Develop
 

@@ -86,3 +86,20 @@ jobs:
           name: coverage-html
           path: coverage/
           if-no-files-found: error
+
+      # cl-coveralls is deliberately not in ocicl.csv — it pulls ~70 systems
+      # (dexador, iolib, cffi, ironclad...) that only this step needs, so the
+      # library's lockfile stays lean and we install it on demand here.
+      # Skipped when the secret is unavailable (e.g. a pull request from a fork).
+      - name: Post coverage to Coveralls (Linux)
+        if: runner.os == 'Linux'
+        env:
+          COVERALLS: "1"
+          COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+        run: |
+          if [ -z "${COVERALLS_REPO_TOKEN:-}" ]; then
+            echo "COVERALLS_REPO_TOKEN unset (fork PR, or the secret is missing) — skipping upload."
+            exit 0
+          fi
+          ocicl install cl-coveralls
+          sbcl --non-interactive --load scripts/coveralls.lisp

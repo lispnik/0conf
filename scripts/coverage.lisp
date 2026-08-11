@@ -10,7 +10,10 @@
 (declaim (optimize sb-cover:store-coverage-data))
 
 ;; Force-recompile just 0conf's own files (deps stay uninstrumented).
+;; 0conf/cli too: the test system depends on it, so it lands in the report either
+;; way once its fasl is stale — force it so the figure doesn't depend on cache state.
 (asdf:load-system :0conf :force t)
+(asdf:load-system :0conf/cli :force t)
 
 ;; Compile/run the tests normally against the instrumented library.
 (asdf:load-system :0conf/test)
