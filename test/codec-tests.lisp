@@ -198,3 +198,71 @@ never a raw array-index error or corrupt data (the reader is bounds-checked)."
     ;; Re-encoding the decoded message reproduces the exact bytes — a strong
     ;; check that both directions (incl. name compression) agree.
     (is (equalp bytes (encode-message decoded)))))
+
+;;; --- packet size discipline (RFC 6762 §17 / §7.2) --------------------------
+
+(defun response-of (records &optional first)
+  "The DNS-MESSAGE a group of RECORDS would be sent as — the shape CHUNK-RECORDS
+measures against."
+  (declare (ignore first))
+  (make-dns-message :flags +flag-response+ :answers records))
+
+(test chunk-records-fills-packets-without-losing-any
+  "Every group fits the budget, and concatenating them gives back the input in
+order — nothing dropped, nothing duplicated."
+  (let* ((records (loop for i from 0 below 100
+                        collect (make-instance 'a-record
+                                               :name (format nil "host~D.local" i)
+                                               :cache-flush t :ttl 120
+                                               :address (parse-ipv4 "10.0.0.1"))))
+         (groups (0conf::chunk-records records 0conf::*max-message-size* #'response-of)))
+    (is (> (length groups) 1))
+    (is (every (lambda (g)
+                 (<= (length (encode-message (response-of g))) 0conf::*max-message-size*))
+               groups))
+    (is (equal records (apply #'append groups)))))
+
+(test an-oversized-record-gets-a-packet-to-itself
+  "RFC 6762 §17: a record too large to share a datagram travels alone, and the
+records around it still pack normally."
+  (let* ((big (make-instance 'txt-record :name "big._x._tcp.local"
+                             :cache-flush t :ttl 120
+                             :strings (loop repeat 40
+                                            collect (format nil "k=~A"
+                                                            (make-string 200
+                                                                         :initial-element #\y)))))
+         (small (make-instance 'a-record :name "h.local" :cache-flush t :ttl 120
+                               :address (parse-ipv4 "10.0.0.1")))
+         (groups (0conf::chunk-records (list small big small)
+                                       0conf::*max-message-size* #'response-of)))
+    (is (> (length (encode-message (response-of (list big)))) 0conf::*max-message-size*))
+    (is (= 3 (length groups)))
+    (is (equal (list big) (second groups)))))
+
+(test known-answer-query-splits-with-the-tc-bit
+  "RFC 6762 §7.2: the question rides in the first packet only, every packet but
+the last sets TC, and no known answer is lost."
+  (let* ((known (loop for i from 0 below 200
+                      collect (make-instance 'ptr-record :name "_ipp._tcp.local" :ttl 4500
+                                             :target (format nil "Printer Number ~D._ipp._tcp.local" i))))
+         (question (make-question :name "_ipp._tcp.local" :qtype +type-ptr+))
+         (packets (0conf::known-answer-query-packets (list question) known))
+         (messages (mapcar #'decode-message packets)))
+    (is (> (length packets) 1))
+    (is (every (lambda (p) (<= (length p) 0conf::*max-message-size*)) packets))
+    (is (= 1 (length (dns-message-questions (first messages)))))
+    (is (every (lambda (m) (null (dns-message-questions m))) (rest messages)))
+    (is (every #'0conf::message-truncated-p (butlast messages)))
+    (is (not (0conf::message-truncated-p (car (last messages)))))
+    (is (= (length known)
+           (loop for m in messages sum (length (dns-message-answers m)))))))
+
+(test known-answer-query-with-nothing-known-is-a-single-packet
+  "The common case must not regress into an empty extra packet."
+  (let* ((question (make-question :name "_ipp._tcp.local" :qtype +type-ptr+))
+         (packets (0conf::known-answer-query-packets (list question) '())))
+    (is (= 1 (length packets)))
+    (let ((m (decode-message (first packets))))
+      (is (= 1 (length (dns-message-questions m))))
+      (is (null (dns-message-answers m)))
+      (is (not (0conf::message-truncated-p m))))))

@@ -298,7 +298,17 @@ egress pinned to, the interface IFACE (a NET-INTERFACE with an :ipv4 address)."
 
 (defun mdns-send (mdns octets &key host (port +mdns-port+))
   "Send OCTETS to HOST:PORT.  HOST defaults to the mDNS group for the socket's
-address family; it is parsed as IPv4 or IPv6 to match."
+address family; it is parsed as IPv4 or IPv6 to match.
+
+A message over the RFC 6762 §17 hard ceiling is dropped rather than sent: the
+senders above this layer split their record sets to stay well under it, so
+arriving here oversized means a single record that cannot legally be put on the
+wire at all."
+  (when (> (length octets) +hard-max-message-size+)
+    (warn "0conf: dropping a ~D-octet mDNS message; RFC 6762 §17 caps a packet at ~
+9000 bytes including IP and UDP headers."
+          (length octets))
+    (return-from mdns-send nil))
   (let* ((family (mdns-socket-family mdns))
          (host (or host (ecase family
                           (:ipv4 +mdns-group-v4+)

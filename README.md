@@ -163,7 +163,7 @@ Dependencies are managed with [ocicl](https://github.com/ocicl/ocicl):
 
 ```sh
 ocicl install                             # restore deps from ocicl.csv
-sbcl --eval '(asdf:test-system :0conf)'   # 58 checks, all pure + FFI socket
+sbcl --eval '(asdf:test-system :0conf)'   # 112 tests / 291 checks
 ```
 
 The test suite is mostly pure (codec / records / cache / DNS-SD), plus
@@ -231,6 +231,28 @@ QU bit, header flags), not just our own encoder's output.
   *response* means the name is already owned (unconditional conflict), and a
   simultaneous prober's *query* is resolved by lexicographic tiebreaking of the
   proposed record sets (§8.2) — we rename only if our data loses.
+- **Conflicts after announcing (§9):** the probe window is not the only time a
+  peer can contradict us. Any response asserting different rdata at a name we
+  hold a *unique* record for puts that name back into probing, on a separate
+  resolver thread (probing sleeps for seconds; a listener must stay free to
+  receive), and every service backed by the name is re-registered under whatever
+  the probe settles on. Identical rdata is never a conflict, so neither our own
+  looped-back multicast nor a proxy answering on our behalf makes us rename; a
+  goodbye is a withdrawal rather than a competing claim; and the comparison is
+  against the whole rrset, so a multi-homed host does not conflict with its own
+  second address. Fifteen conflicts within ten seconds trips the §8.1 backstop —
+  five seconds of wait before each further probe attempt.
+- **Message size (§17):** every outgoing record set is split across as many
+  packets as it needs, each kept under 1400 bytes (the RFC allows up to the MTU
+  less IP+UDP headers, but advises staying under 1500). Because name compression
+  makes a record's encoded length depend on what precedes it, each candidate
+  packet is *measured by encoding it* rather than by summing per-record sizes. A
+  single record too large to share a datagram travels alone, as §17 permits, and
+  anything past the 9000-byte hard ceiling is dropped at the transport instead of
+  being put on the wire. A query carrying a known-answer list splits the §7.2
+  way: the question rides in the first packet only, and every packet but the last
+  sets the TC bit — the sending half of the multipacket known-answer suppression
+  the responder already understood on receive.
 - **Live browsing:** `browse-services` attaches to a running responder and fires
   add/update/remove callbacks as instances appear, change, and vanish. Discovery
   uses a backing-off PTR query (§5.2) with known-answer suppression, plus
