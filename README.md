@@ -163,7 +163,7 @@ Dependencies are managed with [ocicl](https://github.com/ocicl/ocicl):
 
 ```sh
 ocicl install                             # restore deps from ocicl.csv
-sbcl --eval '(asdf:test-system :0conf)'   # 112 tests / 291 checks
+sbcl --eval '(asdf:test-system :0conf)'   # 123 tests / 319 checks
 ```
 
 The test suite is mostly pure (codec / records / cache / DNS-SD), plus
@@ -261,6 +261,17 @@ QU bit, header flags), not just our own encoder's output.
   from the cache on a short poll and diffed. A background sweeper expires stale
   cache entries so removals happen on time. Cross-thread cache access is guarded
   by the responder lock.
-- **Remaining follow-ups:** dynamic interface re-enumeration (a NIC appearing
-  after startup is missed until restart), receive-side interface attribution
+- **Interfaces are re-enumerated, not fixed at startup:** every few seconds the
+  responder diffs the sockets it holds against the interfaces that are actually
+  there, opening one for each new link and retiring the ones whose link is gone —
+  so joining a Wi-Fi network, a VPN coming up, or docking a laptop is picked up
+  without a restart. A NIC that keeps its name but takes a new address (a DHCP
+  renewal) counts as a new link, since that is what `IP_MULTICAST_IF` is pinned
+  to. A new link is a startup as far as our names go (§8.1), so the services are
+  put back through probing on it and re-announced. Two safeguards: an enumeration
+  that comes back empty means "no information", not "no interfaces", and if we
+  wanted new sockets but could not open a single one, the close list is ignored —
+  neither a transient `getifaddrs` failure nor a link whose joins are all failing
+  can leave the responder deaf.
+- **Remaining follow-ups:** receive-side interface attribution
   (`IP_PKTINFO`/`IP_RECVIF`), and a socket-count cap on hosts with very many NICs.

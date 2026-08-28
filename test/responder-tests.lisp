@@ -402,3 +402,76 @@ registered twice."
       (is (find-if (lambda (rec) (and (typep rec 'a-record)
                                       (string-equal (rr-name rec) "myhost-2.local")))
                    (0conf::responder-records r))))))
+
+;;; --- interface changes after startup ---------------------------------------
+
+(test joining-a-link-puts-every-service-back-through-probing
+  "RFC 6762 §8.1: an interface coming up is a startup.  The names we hold may
+already be taken on the network we just joined, so every service is queued for
+the resolver — and host names must be re-probed too, which means forgetting that
+we ever claimed them."
+  (multiple-value-bind (r info) (registered-responder)
+    ;; The fixture registers without probing (it is not on a network), so stand
+    ;; in for the claim a probed registration would have recorded.
+    (setf (gethash (service-info-host info) (0conf::responder-claimed-hosts r)) t)
+    (0conf::restart-services-on-new-link r)
+    (is (equal (list (service-instance-name info)) (0conf::responder-conflicted r)))
+    (is (zerop (hash-table-count (0conf::responder-claimed-hosts r))))))
+
+(test a-responder-given-its-own-socket-leaves-the-interface-list-alone
+  "The loopback tests hand the responder a socket; reconciling that against the
+live NICs would close it out from under them."
+  (let ((r (make-responder)))
+    (is (0conf::responder-manage-interfaces r) "on by default")
+    (handler-case
+        (let ((s (make-mdns-socket :multicast nil :port 0)))
+          (unwind-protect
+               (progn (start-responder r :socket s)
+                      (is (not (0conf::responder-manage-interfaces r))))
+            (stop-responder r)))
+      (error (e) (skip "loopback UDP unavailable: ~A" e)))))
+
+(test a-retired-socket-stops-its-listener
+  "DROP-SOCKET unregisters before closing, so the listener sees the socket go and
+falls out of its loop instead of spinning on a closed descriptor."
+  (handler-case
+      (let ((r (make-responder))
+            (s (make-mdns-socket :multicast nil :port 0)))
+        (unwind-protect
+             (progn
+               (start-responder r :socket s)
+               (is (0conf::socket-active-p r s))
+               (0conf::drop-socket r s)
+               (is (not (0conf::socket-active-p r s)))
+               ;; the listener notices within one poll interval
+               (let ((0conf::*listen-poll-interval* 0.1))
+                 (sleep 0.4))
+               (0conf::prune-dead-threads r)
+               (is (null (remove-if-not #'bordeaux-threads:thread-alive-p
+                                        (0conf::responder-threads r)))))
+          (setf (0conf::responder-running r) nil)
+          (ignore-errors (stop-responder r))))
+    (error (e) (skip "loopback UDP unavailable: ~A" e))))
+
+(test a-rescan-that-can-open-nothing-keeps-the-sockets-it-has
+  "If every join on the new interface list fails, closing the sockets we already
+have would leave the responder deaf.  Wanting sockets and getting none is the
+one case where the close list is ignored."
+  (is (0conf::safe-to-retire-p '() '())            "nothing wanted: closes proceed")
+  (is (0conf::safe-to-retire-p '(:spec) '(:sock))  "opened something: closes proceed")
+  (is (not (0conf::safe-to-retire-p '(:spec) '())) "wanted one, opened none: hold"))
+
+(test rescanning-an-unchanged-machine-opens-nothing
+  "The monitor must be idempotent: with the NICs unchanged, a rescan is a no-op
+rather than a churn of close-and-reopen — and it must not queue any re-probing."
+  (handler-case
+      (let ((r (make-responder)))
+        (unwind-protect
+             (progn
+               (start-responder r)
+               (is (plusp (length (0conf::responder-sockets r))))
+               (is (zerop (0conf::rescan-interfaces r)))
+               (is (null (0conf::responder-conflicted r)))
+               (is (plusp (length (0conf::responder-sockets r)))))
+          (ignore-errors (stop-responder r))))
+    (error (e) (skip "mDNS sockets unavailable: ~A" e))))

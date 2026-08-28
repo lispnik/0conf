@@ -35,7 +35,10 @@
   ;; times of recent conflicts for the §8.1 burst limit.
   (conflicted '())
   (conflict-times '())
-  (resolver nil))
+  (resolver nil)
+  ;; NIL when the caller handed us a socket to use (tests over loopback): we then
+  ;; leave the socket set alone instead of reconciling it with the live NICs.
+  (manage-interfaces t))
 
 (defun response-p (message)
   (logbitp 15 (dns-message-flags message)))   ; QR bit
@@ -45,9 +48,15 @@
 (NIL in pure unit tests, where nothing is actually sent)."
   (first (responder-sockets responder)))
 
+(defun responder-sockets-snapshot (responder)
+  "A locked copy of the socket list — the interface monitor may add or drop
+sockets while a sender is iterating."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (copy-list (responder-sockets responder))))
+
 (defun broadcast (responder octets)
   "Send OCTETS out every socket (each address family's multicast group)."
-  (dolist (socket (responder-sockets responder))
+  (dolist (socket (responder-sockets-snapshot responder))
     (ignore-errors (mdns-send socket octets))))
 
 (defun broadcast-packets (responder packets)
@@ -68,15 +77,11 @@
 interface.  Best-effort: a failed join on one interface never aborts the others.
 Falls back to a single INADDR_ANY socket per family when enumeration yields
 nothing usable (or getifaddrs is unavailable)."
-  (let ((socks '()))
-    (dolist (iface (ignore-errors (list-interfaces)))
-      (when (net-interface-ipv4 iface)
-        (let ((s (ignore-errors (make-ipv4-mdns-socket-on iface))))
-          (when s (push s socks))))
-      (when (net-interface-has-v6 iface)
-        (let ((s (ignore-errors (make-ipv6-mdns-socket-on iface))))
-          (when s (push s socks)))))
-    (or (nreverse socks)
+  (let ((socks (loop for spec in (interface-socket-specs
+                                  (ignore-errors (list-interfaces)))
+                     for s = (open-socket-for-spec spec)
+                     when s collect s)))
+    (or socks
         (remove nil (list (ignore-errors (make-mdns-socket))
                           (ignore-errors (make-mdns-socket :family :ipv6)))))))
 
@@ -85,6 +90,7 @@ nothing usable (or getifaddrs is unavailable)."
 SOCKET, if given, is used as the sole socket (testing over loopback, no
 enumeration); otherwise one socket is opened per usable interface per family."
   (setf (responder-sockets responder) (if socket (list socket) (open-interface-sockets))
+        (responder-manage-interfaces responder) (not socket)
         (responder-running responder) t)
   (setf (responder-threads responder)
         (loop for s in (responder-sockets responder)
@@ -101,27 +107,123 @@ enumeration); otherwise one socket is opened per usable interface per family."
                                       :name "0conf-conflict-resolver"))
   responder)
 
+(defparameter *interface-scan-interval* 5.0
+  "Seconds between re-enumerations of the network interfaces.  A NIC that appears
+— joining a Wi-Fi network, a VPN coming up, docking a laptop — or one that goes
+away is picked up this soon, rather than at the next restart.")
+
+(defun add-socket (responder socket)
+  "Register SOCKET and start a listener for it."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (push socket (responder-sockets responder)))
+  (let ((thread (bordeaux-threads:make-thread
+                 (lambda () (responder-loop responder socket))
+                 :name (format nil "0conf-responder-~A"
+                               (or (mdns-socket-interface-name socket) "any")))))
+    (bordeaux-threads:with-lock-held ((responder-lock responder))
+      (push thread (responder-threads responder))))
+  socket)
+
+(defun drop-socket (responder socket)
+  "Retire SOCKET: unregister it first so its listener sees it go, then close it."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (setf (responder-sockets responder)
+          (remove socket (responder-sockets responder))))
+  (close-mdns-socket socket))
+
+(defun prune-dead-threads (responder)
+  "Forget listeners that have already exited.  The ones still winding down stay
+on the list and are joined by STOP-RESPONDER."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (setf (responder-threads responder)
+          (remove-if-not #'bordeaux-threads:thread-alive-p
+                         (responder-threads responder)))))
+
+(defun restart-services-on-new-link (responder)
+  "A link we have just joined is a startup as far as our names are concerned:
+RFC 6762 §8.1 asks a host to probe again when an interface comes up, since the
+names we hold may already be taken on the network we just walked into.  Queue
+every registered service for the resolver, which withdraws it, re-probes
+(renaming if it loses) and re-announces — out of every socket, the new one
+included.  The claimed-host table is cleared so host names are re-probed too."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (clrhash (responder-claimed-hosts responder))
+    (dolist (info (responder-services responder))
+      (pushnew (service-instance-name info) (responder-conflicted responder)
+               :test #'string-equal))))
+
+(defun safe-to-retire-p (wanted opened)
+  "Whether a rescan should act on its close list.  If we wanted new sockets and
+could not open a single one — every join failing, a NIC still configuring itself,
+a fallback INADDR_ANY socket standing in for an enumeration that has only just
+started working — then the interface list is telling us something we cannot act
+on, and keeping working sockets beats trading them for none."
+  (or (null wanted) (not (null opened))))
+
+(defun rescan-interfaces (responder)
+  "Reconcile our sockets with the interfaces that are actually there: open one
+for each new link, retire the ones whose link is gone, and put our services back
+through probing if anything was added.  Returns the number of sockets opened.
+
+An enumeration that comes back empty means \"no information\", not \"no
+interfaces\": we keep what we have rather than let a transient getifaddrs
+failure leave the responder deaf."
+  (let ((specs (interface-socket-specs (ignore-errors (list-interfaces)))))
+    (if (null specs)
+        0
+        (multiple-value-bind (to-open to-close)
+            (plan-socket-changes (responder-sockets-snapshot responder) specs)
+          ;; Open before closing: an address change briefly leaves two sockets on
+          ;; the NIC, which SO_REUSEPORT makes harmless, and it means a failure to
+          ;; open never costs us the socket we already had.
+          (let ((opened (loop for spec in to-open
+                              for socket = (open-socket-for-spec spec)
+                              when socket collect (add-socket responder socket))))
+            (when (safe-to-retire-p to-open opened)
+              (dolist (socket to-close)
+                (drop-socket responder socket)))
+            (prune-dead-threads responder)
+            (when opened
+              (restart-services-on-new-link responder))
+            (length opened))))))
+
 (defun sweeper-loop (responder)
   "Periodically drop expired cache entries so removals happen on time (and memory
-doesn't grow).  Wakes often enough that STOP-RESPONDER is prompt."
-  (loop while (responder-running responder) do
-    (sleep *cache-sweep-interval*)
-    (bordeaux-threads:with-lock-held ((responder-lock responder))
-      (ignore-errors (cache-expire (responder-cache responder))))
-    (ignore-errors (expire-pending-ka responder))))
+doesn't grow), and re-enumerate the interfaces every *INTERFACE-SCAN-INTERVAL*.
+Wakes often enough that STOP-RESPONDER is prompt.  The scan only opens and closes
+sockets; the probing a new link calls for is queued for the resolver thread, so
+cache expiry is never blocked behind it."
+  (let ((last-scan (get-universal-time)))
+    (loop while (responder-running responder) do
+      (sleep *cache-sweep-interval*)
+      (bordeaux-threads:with-lock-held ((responder-lock responder))
+        (ignore-errors (cache-expire (responder-cache responder))))
+      (ignore-errors (expire-pending-ka responder))
+      (let ((now (get-universal-time)))
+        (when (and (responder-manage-interfaces responder)
+                   (>= (- now last-scan) *interface-scan-interval*))
+          (setf last-scan now)
+          (ignore-errors (rescan-interfaces responder)))))))
+
+(defun socket-active-p (responder socket)
+  "True while SOCKET is still one of the responder's — a listener whose interface
+has gone away uses this to notice and exit."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (and (member socket (responder-sockets responder)) t)))
 
 (defun responder-loop (responder socket)
   ;; Poll with a timeout rather than a plain blocking recv: on Linux, closing the
   ;; socket from STOP-RESPONDER does NOT wake a thread blocked in recvfrom, so a
   ;; blocking recv would hang shutdown.  A bounded wait lets the loop notice
   ;; RUNNING going false and exit promptly on every platform.
-  (loop while (responder-running responder) do
-    (handler-case
-        (multiple-value-bind (octets host port)
-            (mdns-recv-timeout socket *listen-poll-interval*)
-          (when octets (handle-packet responder octets host port socket)))
-      ;; A closed socket or a malformed packet must not kill the loop.
-      (error () nil))))
+  (loop while (and (responder-running responder)
+                   (socket-active-p responder socket))
+        do (handler-case
+               (multiple-value-bind (octets host port)
+                   (mdns-recv-timeout socket *listen-poll-interval*)
+                 (when octets (handle-packet responder octets host port socket)))
+             ;; A closed socket or a malformed packet must not kill the loop.
+             (error () nil))))
 
 (defun stop-responder (responder)
   ;; Best-effort: withdraw everything we advertised before going away, so peers

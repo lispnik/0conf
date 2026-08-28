@@ -291,6 +291,55 @@ egress pinned to, the interface IFACE (a NET-INTERFACE with an :ipv4 address)."
                        :interface-name (net-interface-name iface)
                        :interface-index index)))
 
+;;; --- reconciling sockets with the live interface list -----------------------
+;;;
+;;; The set of usable interfaces is not fixed for the life of a process: Wi-Fi
+;;; reassociates, a VPN comes up, a laptop is docked, DHCP hands out a new
+;;; address.  These let the responder diff what it has open against what is
+;;; actually there.  They are pure — no socket is opened or closed here — so the
+;;; reconciliation logic is testable without a network.
+
+(defun mdns-socket-key (mdns)
+  "Identity of the link a socket serves: NIC name, address family, and whatever
+pins it to that NIC.  An interface that keeps its name but picks up a new IPv4
+address is a different link as far as IP_MULTICAST_IF is concerned, so the key
+changes and the socket gets replaced."
+  (list (mdns-socket-interface-name mdns)
+        (mdns-socket-family mdns)
+        (mdns-socket-interface-address mdns)
+        (mdns-socket-interface-index mdns)))
+
+(defun interface-socket-specs (interfaces)
+  "One (FAMILY IFACE) spec per socket that INTERFACES calls for — an IPv4 socket
+for every NIC with an address, an IPv6 socket for every NIC that has v6."
+  (loop for iface in interfaces
+        when (net-interface-ipv4 iface) collect (list :ipv4 iface)
+        when (net-interface-has-v6 iface) collect (list :ipv6 iface)))
+
+(defun socket-spec-key (spec)
+  "The MDNS-SOCKET-KEY the socket built from SPEC will have."
+  (destructuring-bind (family iface) spec
+    (list (net-interface-name iface) family
+          (when (eq family :ipv4) (net-interface-ipv4 iface))
+          (when (eq family :ipv6) (net-interface-index iface)))))
+
+(defun plan-socket-changes (sockets specs)
+  "Diff the sockets we hold against the sockets the current interface list calls
+for.  Returns (values specs-to-open sockets-to-close)."
+  (let ((have (mapcar #'mdns-socket-key sockets))
+        (want (mapcar #'socket-spec-key specs)))
+    (values (remove-if (lambda (spec) (member (socket-spec-key spec) have :test #'equalp))
+                       specs)
+            (remove-if (lambda (socket) (member (mdns-socket-key socket) want :test #'equalp))
+                       sockets))))
+
+(defun open-socket-for-spec (spec)
+  "Open the socket SPEC describes, or NIL if the join fails on that NIC."
+  (destructuring-bind (family iface) spec
+    (ecase family
+      (:ipv4 (ignore-errors (make-ipv4-mdns-socket-on iface)))
+      (:ipv6 (ignore-errors (make-ipv6-mdns-socket-on iface))))))
+
 (defun close-mdns-socket (mdns)
   (ignore-errors (sb-bsd-sockets:socket-close (mdns-socket-socket mdns))))
 
