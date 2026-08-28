@@ -2,9 +2,11 @@
 
 (defsystem "0conf"
   :description "Pure Common Lisp mDNS (RFC 6762) and DNS-SD (RFC 6763) implementation."
-  :author "Mike Kennedy"
+  :author "Matthew Kennedy"
   :license "MIT"
   :version "0.0.1"
+  :homepage "https://github.com/lispnik/0conf"
+  :source-control (:git "https://github.com/lispnik/0conf.git")
   :depends-on ("alexandria" "nibbles" "bordeaux-threads" "sb-bsd-sockets")
   :serial t
   :pathname "src"
@@ -23,7 +25,7 @@
 
 (defsystem "0conf/cli"
   :description "Command-line mDNS/DNS-SD browser built on 0conf."
-  :author "Mike Kennedy"
+  :author "Matthew Kennedy"
   :license "MIT"
   :depends-on ("0conf")
   :pathname "src"
@@ -34,6 +36,8 @@
 
 (defsystem "0conf/test"
   :description "FiveAM test suite for 0conf."
+  :author "Matthew Kennedy"
+  :license "MIT"
   :depends-on ("0conf" "0conf/cli" "fiveam")
   :serial t
   :pathname "test"

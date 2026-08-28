@@ -163,7 +163,7 @@ Dependencies are managed with [ocicl](https://github.com/ocicl/ocicl):
 
 ```sh
 ocicl install                             # restore deps from ocicl.csv
-sbcl --eval '(asdf:test-system :0conf)'   # 58 checks, all pure + FFI socket
+sbcl --eval '(asdf:test-system :0conf)'   # 97 tests / 250 checks, pure + FFI socket
 ```
 
 The test suite is mostly pure (codec / records / cache / DNS-SD), plus
