@@ -163,7 +163,7 @@ Dependencies are managed with [ocicl](https://github.com/ocicl/ocicl):
 
 ```sh
 ocicl install                             # restore deps from ocicl.csv
-sbcl --eval '(asdf:test-system :0conf)'   # 123 tests / 319 checks
+sbcl --eval '(asdf:test-system :0conf)'   # 142 tests / 368 checks
 ```
 
 The test suite is mostly pure (codec / records / cache / DNS-SD), plus
@@ -273,5 +273,22 @@ QU bit, header flags), not just our own encoder's output.
   wanted new sockets but could not open a single one, the close list is ignored —
   neither a transient `getifaddrs` failure nor a link whose joins are all failing
   can leave the responder deaf.
-- **Remaining follow-ups:** receive-side interface attribution
-  (`IP_PKTINFO`/`IP_RECVIF`), and a socket-count cap on hosts with very many NICs.
+- **Which link did this arrive on?** Every socket binds `INADDR_ANY:5353` with
+  `SO_REUSEPORT`, so the kernel is free to hand a multicast datagram to *any*
+  socket in the reuse group — not necessarily the one that joined the group on
+  the arrival interface. The socket a packet was read from therefore does not
+  identify the link, and replying on it can put the answer on the wrong one. So
+  the sockets ask for `IP_PKTINFO`/`IPV6_PKTINFO` and receive via `recvmsg`,
+  which attaches the receiving interface index; the reply goes out the socket
+  pinned to that link, falling back to the arrival socket when the kernel does
+  not say (index 0, the API's "unspecified", counts as not saying). The
+  `cmsghdr` layout differs between Darwin and Linux — `cmsg_len` is 4 octets on
+  one and 8 on the other, moving the level and type fields with it — so the
+  layout is kept as *data* and the walk over the ancillary data is a pure
+  function, exercised against both platforms' shapes wherever the suite runs.
+- **A cap on sockets:** a host with very many interfaces would otherwise get a
+  socket and a listener thread per NIC per family; `*max-interface-sockets*`
+  (32) bounds it, and reports once rather than dropping links silently.
+- **Remaining follow-ups:** `format-ipv6` writes every group out
+  (`fe80:0:0:0:0:0:0:1`) rather than the RFC 5952 `::` form — only cosmetic, as
+  `parse-ipv6` reads either.

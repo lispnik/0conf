@@ -77,7 +77,7 @@ sockets while a sender is iterating."
 interface.  Best-effort: a failed join on one interface never aborts the others.
 Falls back to a single INADDR_ANY socket per family when enumeration yields
 nothing usable (or getifaddrs is unavailable)."
-  (let ((socks (loop for spec in (interface-socket-specs
+  (let ((socks (loop for spec in (usable-socket-specs
                                   (ignore-errors (list-interfaces)))
                      for s = (open-socket-for-spec spec)
                      when s collect s)))
@@ -168,7 +168,7 @@ through probing if anything was added.  Returns the number of sockets opened.
 An enumeration that comes back empty means \"no information\", not \"no
 interfaces\": we keep what we have rather than let a transient getifaddrs
 failure leave the responder deaf."
-  (let ((specs (interface-socket-specs (ignore-errors (list-interfaces)))))
+  (let ((specs (usable-socket-specs (ignore-errors (list-interfaces)))))
     (if (null specs)
         0
         (multiple-value-bind (to-open to-close)
@@ -205,6 +205,22 @@ cache expiry is never blocked behind it."
           (setf last-scan now)
           (ignore-errors (rescan-interfaces responder)))))))
 
+(defun socket-for-arrival (responder socket ifindex)
+  "The socket to answer a datagram on, given the interface index it arrived on.
+
+Every socket binds INADDR_ANY:5353 with SO_REUSEPORT, so the kernel may hand a
+multicast datagram to any socket in the reuse group — not necessarily the one
+that joined the group on the arrival interface.  Replying on the socket it was
+read from can therefore put the answer on the wrong link.  When the kernel told
+us the interface, answer on the socket pinned to it; when it did not, fall back
+to the arrival socket, which is what we did before we could ask."
+  (or (and ifindex
+           (find-if (lambda (s)
+                      (and (eq (mdns-socket-family s) (mdns-socket-family socket))
+                           (eql (mdns-socket-interface-index s) ifindex)))
+                    (responder-sockets-snapshot responder)))
+      socket))
+
 (defun socket-active-p (responder socket)
   "True while SOCKET is still one of the responder's — a listener whose interface
 has gone away uses this to notice and exit."
@@ -219,9 +235,11 @@ has gone away uses this to notice and exit."
   (loop while (and (responder-running responder)
                    (socket-active-p responder socket))
         do (handler-case
-               (multiple-value-bind (octets host port)
+               (multiple-value-bind (octets host port ifindex)
                    (mdns-recv-timeout socket *listen-poll-interval*)
-                 (when octets (handle-packet responder octets host port socket)))
+                 (when octets
+                   (handle-packet responder octets host port
+                                  (socket-for-arrival responder socket ifindex))))
              ;; A closed socket or a malformed packet must not kill the loop.
              (error () nil))))
 

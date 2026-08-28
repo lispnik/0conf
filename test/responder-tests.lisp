@@ -475,3 +475,63 @@ rather than a churn of close-and-reopen — and it must not queue any re-probing
                (is (plusp (length (0conf::responder-sockets r)))))
           (ignore-errors (stop-responder r))))
     (error (e) (skip "mDNS sockets unavailable: ~A" e))))
+
+;;; --- answering on the link a query arrived on ------------------------------
+
+(test the-reply-goes-out-the-interface-the-query-came-in-on
+  "SO_REUSEPORT means the kernel may hand a multicast datagram to any socket in
+the group, so the socket a query was read from does not identify the link.  Given
+the arrival index, the reply must go out the socket pinned to that link."
+  (let* ((r (make-responder))
+         (en0 (fake-socket "en0" :ipv4 :address #(192 168 1 5) :index 4))
+         (en1 (fake-socket "en1" :ipv4 :address #(10 0 0 2) :index 7)))
+    (setf (0conf::responder-sockets r) (list en0 en1))
+    ;; read from en0's socket, but the kernel says it arrived on en1's link
+    (is (eq en1 (0conf::socket-for-arrival r en0 7)))
+    (is (eq en0 (0conf::socket-for-arrival r en1 4)))))
+
+(test an-unknown-arrival-index-falls-back-to-the-arrival-socket
+  "NIL means the kernel did not tell us, and an index we hold no socket for means
+the link went away between arrival and reply.  Both keep the old behaviour."
+  (let* ((r (make-responder))
+         (en0 (fake-socket "en0" :ipv4 :address #(192 168 1 5) :index 4)))
+    (setf (0conf::responder-sockets r) (list en0))
+    (is (eq en0 (0conf::socket-for-arrival r en0 nil)))
+    (is (eq en0 (0conf::socket-for-arrival r en0 99)))))
+
+(test the-reply-socket-must-match-the-address-family
+  "A v4 and a v6 socket on one NIC share an interface index; answering a v4
+query on the v6 socket would send it to the wrong group entirely."
+  (let* ((r (make-responder))
+         (v4 (fake-socket "en0" :ipv4 :address #(192 168 1 5) :index 4))
+         (v6 (fake-socket "en0" :ipv6 :index 4)))
+    (setf (0conf::responder-sockets r) (list v6 v4))
+    (is (eq v4 (0conf::socket-for-arrival r v4 4)))
+    (is (eq v6 (0conf::socket-for-arrival r v6 4)))))
+
+(test a-datagram-over-loopback-carries-its-peer-and-arrival-details
+  "End to end through recvmsg: the datagram, the peer address and port all come
+back intact.  The arrival index is whatever the kernel says — 0/absent for
+looped-back traffic on Darwin — so it is only required to be absent or real,
+never fabricated."
+  (handler-case
+      (let ((a (make-mdns-socket :multicast nil :port 0))
+            (b (make-mdns-socket :multicast nil :port 0)))
+        (unwind-protect
+             (let ((bport (nth-value 1 (sb-bsd-sockets:socket-name
+                                        (0conf::mdns-socket-socket b)))))
+               (mdns-send a (make-array 3 :element-type '(unsigned-byte 8)
+                                          :initial-element 65)
+                          :host "127.0.0.1" :port bport)
+               (multiple-value-bind (octets host port ifindex)
+                   (mdns-recv-timeout b 2.0)
+                 (is (equalp #(65 65 65) octets))
+                 (is (string= "127.0.0.1" host))
+                 (is (integerp port))
+                 ;; NB: not '(is (or ...))' — FiveAM evaluates both branches of
+                 ;; an OR to report on them, so a short-circuit that Lisp would
+                 ;; take is still evaluated, and (plusp nil) would error.
+                 (is (typep ifindex '(or null (integer 1 *))))))
+          (close-mdns-socket a)
+          (close-mdns-socket b)))
+    (error (e) (skip "loopback UDP unavailable: ~A" e))))
