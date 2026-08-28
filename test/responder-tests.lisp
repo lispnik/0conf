@@ -254,3 +254,284 @@ if it had arrived in a continuation packet (§7.2)."
       (declare (ignore additionals))
       (is (find-if (lambda (x) (typep x 'aaaa-record)) answers))
       (is (not (find-if (lambda (x) (typep x 'nsec-record)) answers))))))
+
+;;; --- §9 conflict resolution after announcing -------------------------------
+
+(defun registered-responder (&key (name "Printer") (host "myhost.local")
+                                  (addresses (list (parse-ipv4 "10.0.0.7"))))
+  "A responder holding one announced service, with no sockets and no probing —
+so the §9 paths can be driven deterministically.  Returns (values responder info)."
+  (let ((r (make-responder))
+        (info (make-service-info :type "_ipp._tcp.local" :name name :host host
+                                 :port 631 :addresses addresses)))
+    (register-service r info :probe nil)
+    (values r info)))
+
+(defun peer-address-record (name dotted)
+  (make-instance 'a-record :name name :cache-flush t :ttl 120
+                           :address (parse-ipv4 dotted)))
+
+(test differing-rdata-at-a-name-we-own-is-a-conflict
+  "RFC 6762 §9: another host claiming our host name with a different address."
+  (let ((r (registered-responder)))
+    (is (0conf::conflicting-record-p
+         (0conf::responder-records r)
+         (peer-address-record "myhost.local" "10.0.0.99")))))
+
+(test identical-rdata-is-never-a-conflict
+  "§9 is explicit: identical rdata is never inconsistent, even from another host
+— that is what lets a proxy answer on our behalf.  It is also why our own
+looped-back multicast does not make us rename ourselves."
+  (let ((r (registered-responder)))
+    (is (not (0conf::conflicting-record-p
+              (0conf::responder-records r)
+              (peer-address-record "myhost.local" "10.0.0.7"))))))
+
+(test a-multi-homed-rrset-does-not-conflict-with-its-own-members
+  "Two addresses at one name are one rrset, so seeing either of them back is
+consistent — the comparison is against the whole set, not record by record."
+  (let ((r (registered-responder :addresses (list (parse-ipv4 "10.0.0.7")
+                                                  (parse-ipv4 "192.168.1.5")))))
+    (is (not (0conf::conflicting-record-p (0conf::responder-records r)
+                                          (peer-address-record "myhost.local" "10.0.0.7"))))
+    (is (not (0conf::conflicting-record-p (0conf::responder-records r)
+                                          (peer-address-record "myhost.local" "192.168.1.5"))))
+    (is (0conf::conflicting-record-p (0conf::responder-records r)
+                                     (peer-address-record "myhost.local" "172.16.0.1")))))
+
+(test shared-records-never-conflict
+  "A DNS-SD PTR is shared by every instance of the type, so another host's
+instance appearing at that name is normal, not a conflict."
+  (let ((r (registered-responder)))
+    (is (not (0conf::conflicting-record-p
+              (0conf::responder-records r)
+              (make-instance 'ptr-record :name "_ipp._tcp.local" :ttl 4500
+                             :target "Someone Else._ipp._tcp.local"))))))
+
+(test a-goodbye-is-a-withdrawal-not-a-competing-claim
+  "A ttl-0 record says the peer is going away; renaming ourselves over it would
+be exactly backwards."
+  (let ((r (registered-responder))
+        (goodbye (make-instance 'a-record :name "myhost.local" :cache-flush t :ttl 0
+                                :address (parse-ipv4 "10.0.0.99"))))
+    (0conf::detect-record-conflicts r (list goodbye))
+    (is (null (0conf::responder-conflicted r)))))
+
+(test a-conflicting-response-queues-the-name-for-reprobing
+  "End to end through HANDLE-PACKET: the name lands on the resolver's queue."
+  (let ((r (registered-responder)))
+    (0conf::handle-packet r (a-response-for "myhost.local") "10.0.0.2" 5353)
+    (is (equal '("myhost.local") (0conf::responder-conflicted r)))
+    ;; and it is taken exactly once
+    (is (equal '("myhost.local") (0conf::take-conflicted r)))
+    (is (null (0conf::responder-conflicted r)))))
+
+(test an-unrelated-response-queues-nothing
+  (let ((r (registered-responder)))
+    (0conf::handle-packet r (a-response-for "someone-else.local") "10.0.0.2" 5353)
+    (is (null (0conf::responder-conflicted r)))))
+
+(test conflict-burst-limit-trips-at-fifteen-in-ten-seconds
+  "RFC 6762 §8.1: fifteen conflicts in ten seconds and every further probe
+attempt must wait.  Older timestamps age out of the window."
+  (let ((r (make-responder))
+        (now (get-universal-time)))
+    (setf (0conf::responder-conflict-times r) (make-list 14 :initial-element now))
+    (is (not (0conf::conflict-rate-limited-p r now)))
+    (push now (0conf::responder-conflict-times r))
+    (is (0conf::conflict-rate-limited-p r now))
+    ;; A burst that has aged past the window no longer counts, and is discarded.
+    (setf (0conf::responder-conflict-times r)
+          (make-list 20 :initial-element (- now 11)))
+    (is (not (0conf::conflict-rate-limited-p r now)))
+    (is (null (0conf::responder-conflict-times r)))))
+
+(test resolving-a-conflict-reprobes-and-leaves-one-clean-record-set
+  "The corrective action withdraws what we held at the name and runs §8 again.
+With no peer defending during the re-probe we keep the name — and must end up
+registered exactly once, with no duplicated records left behind."
+  (multiple-value-bind (r info) (registered-responder)
+    (0conf::resolve-conflict r "myhost.local")
+    (is (string= "myhost.local" (service-info-host info)))
+    (is (= 1 (count info (0conf::responder-services r))))
+    (is (= 1 (count-if (lambda (rec) (and (typep rec 'a-record)
+                                          (string-equal (rr-name rec) "myhost.local")))
+                       (0conf::responder-records r))))))
+
+(test a-large-record-set-is-announced-as-several-packets
+  "RFC 6762 §17: an announcement too big for one datagram is split, and each
+packet stays under the cap."
+  (let* ((records (loop for i from 0 below 60
+                        collect (make-instance 'txt-record
+                                               :name (format nil "svc~D._x._tcp.local" i)
+                                               :cache-flush t :ttl 120
+                                               :strings (list (format nil "key=~A"
+                                                                      (make-string 60 :initial-element #\x))))))
+         (packets (0conf::response-packets nil records '() nil)))
+    (is (> (length packets) 1))
+    (is (every (lambda (p) (<= (length p) 0conf::*max-message-size*)) packets))
+    (is (= (length records)
+           (loop for p in packets
+                 sum (length (dns-message-answers (decode-message p))))))))
+
+(test a-defended-name-is-surrendered-when-the-conflict-is-resolved
+  "The whole point of §9: a peer still asserting our name when we go back to
+probing wins it, and we come back under a new one — without the service being
+registered twice."
+  (multiple-value-bind (r info) (registered-responder)
+    (let* ((running t)
+           (defender (bordeaux-threads:make-thread
+                      (lambda ()
+                        ;; Stand in for the other host: answer for the name for
+                        ;; as long as we are probing it.
+                        (loop while running do
+                          (let ((probing (0conf::responder-probing r)))
+                            (when (and probing (string-equal probing "myhost.local"))
+                              (ignore-errors
+                               (0conf::handle-packet r (a-response-for "myhost.local")
+                                                     "10.0.0.2" 5353))))
+                          (sleep 0.01)))
+                      :name "0conf-test-defender")))
+      (unwind-protect
+           (let ((0conf::*probe-conflict-backoff* 0))
+             (0conf::resolve-conflict r "myhost.local"))
+        (setf running nil)
+        (bordeaux-threads:join-thread defender))
+      (is (string= "myhost-2.local" (service-info-host info)))
+      (is (= 1 (count info (0conf::responder-services r))))
+      (is (find-if (lambda (rec) (and (typep rec 'a-record)
+                                      (string-equal (rr-name rec) "myhost-2.local")))
+                   (0conf::responder-records r))))))
+
+;;; --- interface changes after startup ---------------------------------------
+
+(test joining-a-link-puts-every-service-back-through-probing
+  "RFC 6762 §8.1: an interface coming up is a startup.  The names we hold may
+already be taken on the network we just joined, so every service is queued for
+the resolver — and host names must be re-probed too, which means forgetting that
+we ever claimed them."
+  (multiple-value-bind (r info) (registered-responder)
+    ;; The fixture registers without probing (it is not on a network), so stand
+    ;; in for the claim a probed registration would have recorded.
+    (setf (gethash (service-info-host info) (0conf::responder-claimed-hosts r)) t)
+    (0conf::restart-services-on-new-link r)
+    (is (equal (list (service-instance-name info)) (0conf::responder-conflicted r)))
+    (is (zerop (hash-table-count (0conf::responder-claimed-hosts r))))))
+
+(test a-responder-given-its-own-socket-leaves-the-interface-list-alone
+  "The loopback tests hand the responder a socket; reconciling that against the
+live NICs would close it out from under them."
+  (let ((r (make-responder)))
+    (is (0conf::responder-manage-interfaces r) "on by default")
+    (handler-case
+        (let ((s (make-mdns-socket :multicast nil :port 0)))
+          (unwind-protect
+               (progn (start-responder r :socket s)
+                      (is (not (0conf::responder-manage-interfaces r))))
+            (stop-responder r)))
+      (error (e) (skip "loopback UDP unavailable: ~A" e)))))
+
+(test a-retired-socket-stops-its-listener
+  "DROP-SOCKET unregisters before closing, so the listener sees the socket go and
+falls out of its loop instead of spinning on a closed descriptor."
+  (handler-case
+      (let ((r (make-responder))
+            (s (make-mdns-socket :multicast nil :port 0)))
+        (unwind-protect
+             (progn
+               (start-responder r :socket s)
+               (is (0conf::socket-active-p r s))
+               (0conf::drop-socket r s)
+               (is (not (0conf::socket-active-p r s)))
+               ;; the listener notices within one poll interval
+               (let ((0conf::*listen-poll-interval* 0.1))
+                 (sleep 0.4))
+               (0conf::prune-dead-threads r)
+               (is (null (remove-if-not #'bordeaux-threads:thread-alive-p
+                                        (0conf::responder-threads r)))))
+          (setf (0conf::responder-running r) nil)
+          (ignore-errors (stop-responder r))))
+    (error (e) (skip "loopback UDP unavailable: ~A" e))))
+
+(test a-rescan-that-can-open-nothing-keeps-the-sockets-it-has
+  "If every join on the new interface list fails, closing the sockets we already
+have would leave the responder deaf.  Wanting sockets and getting none is the
+one case where the close list is ignored."
+  (is (0conf::safe-to-retire-p '() '())            "nothing wanted: closes proceed")
+  (is (0conf::safe-to-retire-p '(:spec) '(:sock))  "opened something: closes proceed")
+  (is (not (0conf::safe-to-retire-p '(:spec) '())) "wanted one, opened none: hold"))
+
+(test rescanning-an-unchanged-machine-opens-nothing
+  "The monitor must be idempotent: with the NICs unchanged, a rescan is a no-op
+rather than a churn of close-and-reopen — and it must not queue any re-probing."
+  (handler-case
+      (let ((r (make-responder)))
+        (unwind-protect
+             (progn
+               (start-responder r)
+               (is (plusp (length (0conf::responder-sockets r))))
+               (is (zerop (0conf::rescan-interfaces r)))
+               (is (null (0conf::responder-conflicted r)))
+               (is (plusp (length (0conf::responder-sockets r)))))
+          (ignore-errors (stop-responder r))))
+    (error (e) (skip "mDNS sockets unavailable: ~A" e))))
+
+;;; --- answering on the link a query arrived on ------------------------------
+
+(test the-reply-goes-out-the-interface-the-query-came-in-on
+  "SO_REUSEPORT means the kernel may hand a multicast datagram to any socket in
+the group, so the socket a query was read from does not identify the link.  Given
+the arrival index, the reply must go out the socket pinned to that link."
+  (let* ((r (make-responder))
+         (en0 (fake-socket "en0" :ipv4 :address #(192 168 1 5) :index 4))
+         (en1 (fake-socket "en1" :ipv4 :address #(10 0 0 2) :index 7)))
+    (setf (0conf::responder-sockets r) (list en0 en1))
+    ;; read from en0's socket, but the kernel says it arrived on en1's link
+    (is (eq en1 (0conf::socket-for-arrival r en0 7)))
+    (is (eq en0 (0conf::socket-for-arrival r en1 4)))))
+
+(test an-unknown-arrival-index-falls-back-to-the-arrival-socket
+  "NIL means the kernel did not tell us, and an index we hold no socket for means
+the link went away between arrival and reply.  Both keep the old behaviour."
+  (let* ((r (make-responder))
+         (en0 (fake-socket "en0" :ipv4 :address #(192 168 1 5) :index 4)))
+    (setf (0conf::responder-sockets r) (list en0))
+    (is (eq en0 (0conf::socket-for-arrival r en0 nil)))
+    (is (eq en0 (0conf::socket-for-arrival r en0 99)))))
+
+(test the-reply-socket-must-match-the-address-family
+  "A v4 and a v6 socket on one NIC share an interface index; answering a v4
+query on the v6 socket would send it to the wrong group entirely."
+  (let* ((r (make-responder))
+         (v4 (fake-socket "en0" :ipv4 :address #(192 168 1 5) :index 4))
+         (v6 (fake-socket "en0" :ipv6 :index 4)))
+    (setf (0conf::responder-sockets r) (list v6 v4))
+    (is (eq v4 (0conf::socket-for-arrival r v4 4)))
+    (is (eq v6 (0conf::socket-for-arrival r v6 4)))))
+
+(test a-datagram-over-loopback-carries-its-peer-and-arrival-details
+  "End to end through recvmsg: the datagram, the peer address and port all come
+back intact.  The arrival index is whatever the kernel says — 0/absent for
+looped-back traffic on Darwin — so it is only required to be absent or real,
+never fabricated."
+  (handler-case
+      (let ((a (make-mdns-socket :multicast nil :port 0))
+            (b (make-mdns-socket :multicast nil :port 0)))
+        (unwind-protect
+             (let ((bport (nth-value 1 (sb-bsd-sockets:socket-name
+                                        (0conf::mdns-socket-socket b)))))
+               (mdns-send a (make-array 3 :element-type '(unsigned-byte 8)
+                                          :initial-element 65)
+                          :host "127.0.0.1" :port bport)
+               (multiple-value-bind (octets host port ifindex)
+                   (mdns-recv-timeout b 2.0)
+                 (is (equalp #(65 65 65) octets))
+                 (is (string= "127.0.0.1" host))
+                 (is (integerp port))
+                 ;; NB: not '(is (or ...))' — FiveAM evaluates both branches of
+                 ;; an OR to report on them, so a short-circuit that Lisp would
+                 ;; take is still evaluated, and (plusp nil) would error.
+                 (is (typep ifindex '(or null (integer 1 *))))))
+          (close-mdns-socket a)
+          (close-mdns-socket b)))
+    (error (e) (skip "loopback UDP unavailable: ~A" e))))

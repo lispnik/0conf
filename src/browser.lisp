@@ -192,11 +192,14 @@ that would only repeat them stay quiet (known-answer suppression)."
          (type (service-browser-type browser))
          (known (bordeaux-threads:with-lock-held ((responder-lock responder))
                   (cache-get (responder-cache responder) type +type-ptr+))))
-    (broadcast responder
-               (encode-message
-                (make-dns-message
-                 :questions (list (make-question :name type :qtype +type-ptr+))
-                 :answers known)))))
+    ;; The known-answer list grows with every instance we have seen, so on a
+    ;; busy link it is the one query that outgrows a datagram: split it across
+    ;; packets with the TC bit rather than emitting one oversized one (§7.2).
+    (broadcast-packets
+     responder
+     (known-answer-query-packets
+      (list (make-question :name type :qtype +type-ptr+))
+      known))))
 
 (defun diff-and-notify (browser)
   "Recompute the live instance set from the cache and fire add/update/remove."

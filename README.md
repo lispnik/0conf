@@ -163,7 +163,7 @@ Dependencies are managed with [ocicl](https://github.com/ocicl/ocicl):
 
 ```sh
 ocicl install                             # restore deps from ocicl.csv
-sbcl --eval '(asdf:test-system :0conf)'   # 97 tests / 250 checks, pure + FFI socket
+sbcl --eval '(asdf:test-system :0conf)'   # 142 tests / 368 checks, pure + loopback
 ```
 
 The test suite is mostly pure (codec / records / cache / DNS-SD), plus
@@ -231,6 +231,28 @@ QU bit, header flags), not just our own encoder's output.
   *response* means the name is already owned (unconditional conflict), and a
   simultaneous prober's *query* is resolved by lexicographic tiebreaking of the
   proposed record sets (§8.2) — we rename only if our data loses.
+- **Conflicts after announcing (§9):** the probe window is not the only time a
+  peer can contradict us. Any response asserting different rdata at a name we
+  hold a *unique* record for puts that name back into probing, on a separate
+  resolver thread (probing sleeps for seconds; a listener must stay free to
+  receive), and every service backed by the name is re-registered under whatever
+  the probe settles on. Identical rdata is never a conflict, so neither our own
+  looped-back multicast nor a proxy answering on our behalf makes us rename; a
+  goodbye is a withdrawal rather than a competing claim; and the comparison is
+  against the whole rrset, so a multi-homed host does not conflict with its own
+  second address. Fifteen conflicts within ten seconds trips the §8.1 backstop —
+  five seconds of wait before each further probe attempt.
+- **Message size (§17):** every outgoing record set is split across as many
+  packets as it needs, each kept under 1400 bytes (the RFC allows up to the MTU
+  less IP+UDP headers, but advises staying under 1500). Because name compression
+  makes a record's encoded length depend on what precedes it, each candidate
+  packet is *measured by encoding it* rather than by summing per-record sizes. A
+  single record too large to share a datagram travels alone, as §17 permits, and
+  anything past the 9000-byte hard ceiling is dropped at the transport instead of
+  being put on the wire. A query carrying a known-answer list splits the §7.2
+  way: the question rides in the first packet only, and every packet but the last
+  sets the TC bit — the sending half of the multipacket known-answer suppression
+  the responder already understood on receive.
 - **Live browsing:** `browse-services` attaches to a running responder and fires
   add/update/remove callbacks as instances appear, change, and vanish. Discovery
   uses a backing-off PTR query (§5.2) with known-answer suppression, plus
@@ -239,6 +261,34 @@ QU bit, header flags), not just our own encoder's output.
   from the cache on a short poll and diffed. A background sweeper expires stale
   cache entries so removals happen on time. Cross-thread cache access is guarded
   by the responder lock.
-- **Remaining follow-ups:** dynamic interface re-enumeration (a NIC appearing
-  after startup is missed until restart), receive-side interface attribution
-  (`IP_PKTINFO`/`IP_RECVIF`), and a socket-count cap on hosts with very many NICs.
+- **Interfaces are re-enumerated, not fixed at startup:** every few seconds the
+  responder diffs the sockets it holds against the interfaces that are actually
+  there, opening one for each new link and retiring the ones whose link is gone —
+  so joining a Wi-Fi network, a VPN coming up, or docking a laptop is picked up
+  without a restart. A NIC that keeps its name but takes a new address (a DHCP
+  renewal) counts as a new link, since that is what `IP_MULTICAST_IF` is pinned
+  to. A new link is a startup as far as our names go (§8.1), so the services are
+  put back through probing on it and re-announced. Two safeguards: an enumeration
+  that comes back empty means "no information", not "no interfaces", and if we
+  wanted new sockets but could not open a single one, the close list is ignored —
+  neither a transient `getifaddrs` failure nor a link whose joins are all failing
+  can leave the responder deaf.
+- **Which link did this arrive on?** Every socket binds `INADDR_ANY:5353` with
+  `SO_REUSEPORT`, so the kernel is free to hand a multicast datagram to *any*
+  socket in the reuse group — not necessarily the one that joined the group on
+  the arrival interface. The socket a packet was read from therefore does not
+  identify the link, and replying on it can put the answer on the wrong one. So
+  the sockets ask for `IP_PKTINFO`/`IPV6_PKTINFO` and receive via `recvmsg`,
+  which attaches the receiving interface index; the reply goes out the socket
+  pinned to that link, falling back to the arrival socket when the kernel does
+  not say (index 0, the API's "unspecified", counts as not saying). The
+  `cmsghdr` layout differs between Darwin and Linux — `cmsg_len` is 4 octets on
+  one and 8 on the other, moving the level and type fields with it — so the
+  layout is kept as *data* and the walk over the ancillary data is a pure
+  function, exercised against both platforms' shapes wherever the suite runs.
+- **A cap on sockets:** a host with very many interfaces would otherwise get a
+  socket and a listener thread per NIC per family; `*max-interface-sockets*`
+  (32) bounds it, and reports once rather than dropping links silently.
+- **Remaining follow-ups:** `format-ipv6` writes every group out
+  (`fe80:0:0:0:0:0:0:1`) rather than the RFC 5952 `::` form — only cosmetic, as
+  `parse-ipv6` reads either.
