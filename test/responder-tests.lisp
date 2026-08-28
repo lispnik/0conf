@@ -423,35 +423,47 @@ we ever claimed them."
 live NICs would close it out from under them."
   (let ((r (make-responder)))
     (is (0conf::responder-manage-interfaces r) "on by default")
-    (handler-case
-        (let ((s (make-mdns-socket :multicast nil :port 0)))
-          (unwind-protect
-               (progn (start-responder r :socket s)
-                      (is (not (0conf::responder-manage-interfaces r))))
-            (stop-responder r)))
-      (error (e) (skip "loopback UDP unavailable: ~A" e)))))
+    (let ((s (handler-case (make-mdns-socket :multicast nil :port 0)
+               (error (e) (skip "loopback UDP unavailable: ~A" e) nil))))
+      (when s
+        (unwind-protect
+             (progn (start-responder r :socket s)
+                    (is (not (0conf::responder-manage-interfaces r))))
+          (ignore-errors (stop-responder r)))))))
+
+(defun wait-for-threads-to-exit (responder seconds)
+  "Wait up to SECONDS for RESPONDER's listeners to fall out of their loops.
+A listener wakes at most once per *LISTEN-POLL-INTERVAL*, and it reads that
+special in its own thread — binding it here would not reach it — so the wait is
+for the threads themselves rather than for a guessed duration."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* seconds internal-time-units-per-second))))
+    (loop while (and (some #'bordeaux-threads:thread-alive-p
+                           (0conf::responder-threads responder))
+                     (< (get-internal-real-time) deadline))
+          do (sleep 0.05))))
 
 (test a-retired-socket-stops-its-listener
   "DROP-SOCKET unregisters before closing, so the listener sees the socket go and
-falls out of its loop instead of spinning on a closed descriptor."
-  (handler-case
-      (let ((r (make-responder))
-            (s (make-mdns-socket :multicast nil :port 0)))
+falls out of its loop instead of spinning on a closed descriptor.
+
+Only the socket creation is guarded: wrapping the assertions too would turn a
+real failure into a skip, which is how this test hid a genuine one."
+  (let ((s (handler-case (make-mdns-socket :multicast nil :port 0)
+             (error (e) (skip "loopback UDP unavailable: ~A" e) nil))))
+    (when s
+      (let ((r (make-responder)))
         (unwind-protect
              (progn
                (start-responder r :socket s)
                (is (0conf::socket-active-p r s))
                (0conf::drop-socket r s)
                (is (not (0conf::socket-active-p r s)))
-               ;; the listener notices within one poll interval
-               (let ((0conf::*listen-poll-interval* 0.1))
-                 (sleep 0.4))
+               (wait-for-threads-to-exit r 10)
                (0conf::prune-dead-threads r)
-               (is (null (remove-if-not #'bordeaux-threads:thread-alive-p
-                                        (0conf::responder-threads r)))))
+               (is (null (0conf::responder-threads r))))
           (setf (0conf::responder-running r) nil)
-          (ignore-errors (stop-responder r))))
-    (error (e) (skip "loopback UDP unavailable: ~A" e))))
+          (ignore-errors (stop-responder r)))))))
 
 (test a-rescan-that-can-open-nothing-keeps-the-sockets-it-has
   "If every join on the new interface list fails, closing the sockets we already
@@ -464,17 +476,17 @@ one case where the close list is ignored."
 (test rescanning-an-unchanged-machine-opens-nothing
   "The monitor must be idempotent: with the NICs unchanged, a rescan is a no-op
 rather than a churn of close-and-reopen — and it must not queue any re-probing."
-  (handler-case
-      (let ((r (make-responder)))
-        (unwind-protect
-             (progn
-               (start-responder r)
-               (is (plusp (length (0conf::responder-sockets r))))
-               (is (zerop (0conf::rescan-interfaces r)))
-               (is (null (0conf::responder-conflicted r)))
-               (is (plusp (length (0conf::responder-sockets r)))))
-          (ignore-errors (stop-responder r))))
-    (error (e) (skip "mDNS sockets unavailable: ~A" e))))
+  (let* ((r (make-responder))
+         (started (handler-case (progn (start-responder r) t)
+                    (error (e) (skip "mDNS sockets unavailable: ~A" e) nil))))
+    (when started
+      (unwind-protect
+           (progn
+             (is (plusp (length (0conf::responder-sockets r))))
+             (is (zerop (0conf::rescan-interfaces r)))
+             (is (null (0conf::responder-conflicted r)))
+             (is (plusp (length (0conf::responder-sockets r)))))
+        (ignore-errors (stop-responder r))))))
 
 ;;; --- answering on the link a query arrived on ------------------------------
 
@@ -514,9 +526,11 @@ query on the v6 socket would send it to the wrong group entirely."
 back intact.  The arrival index is whatever the kernel says — 0/absent for
 looped-back traffic on Darwin — so it is only required to be absent or real,
 never fabricated."
-  (handler-case
-      (let ((a (make-mdns-socket :multicast nil :port 0))
-            (b (make-mdns-socket :multicast nil :port 0)))
+  (let ((pair (handler-case (list (make-mdns-socket :multicast nil :port 0)
+                                  (make-mdns-socket :multicast nil :port 0))
+                (error (e) (skip "loopback UDP unavailable: ~A" e) nil))))
+    (when pair
+      (destructuring-bind (a b) pair
         (unwind-protect
              (let ((bport (nth-value 1 (sb-bsd-sockets:socket-name
                                         (0conf::mdns-socket-socket b)))))
@@ -533,5 +547,4 @@ never fabricated."
                  ;; take is still evaluated, and (plusp nil) would error.
                  (is (typep ifindex '(or null (integer 1 *))))))
           (close-mdns-socket a)
-          (close-mdns-socket b)))
-    (error (e) (skip "loopback UDP unavailable: ~A" e))))
+          (close-mdns-socket b))))))
