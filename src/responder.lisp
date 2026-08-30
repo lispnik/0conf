@@ -36,6 +36,15 @@
   (conflicted '())
   (conflict-times '())
   (resolver nil)
+  ;; Probing uses the single PROBING/PROBE-RECORDS/CONFLICT slot set above, so
+  ;; only one name may be claimed at a time.  Before §9 the only prober was the
+  ;; thread that called REGISTER-SERVICE; the resolver is now a second one, and
+  ;; two overlapping probes would read each other's conflict flag.
+  (claim-lock (bordeaux-threads:make-lock "0conf-claim"))
+  ;; Distinct from RUNNING being NIL, which is also the state of a responder that
+  ;; was never started: this says a stop is in progress, so background work
+  ;; should wind up rather than start something new.
+  (stopping nil)
   ;; NIL when the caller handed us a socket to use (tests over loopback): we then
   ;; leave the socket set alone instead of reconciling it with the live NICs.
   (manage-interfaces t))
@@ -91,6 +100,7 @@ SOCKET, if given, is used as the sole socket (testing over loopback, no
 enumeration); otherwise one socket is opened per usable interface per family."
   (setf (responder-sockets responder) (if socket (list socket) (open-interface-sockets))
         (responder-manage-interfaces responder) (not socket)
+        (responder-stopping responder) nil          ; a restart is not still stopping
         (responder-running responder) t)
   (setf (responder-threads responder)
         (loop for s in (responder-sockets responder)
@@ -244,18 +254,30 @@ has gone away uses this to notice and exit."
              (error () nil))))
 
 (defun stop-responder (responder)
+  ;; Announce the stop *first*.  The §9 resolver re-registers services from its
+  ;; own thread, and a resolution already in flight would otherwise finish after
+  ;; the goodbyes and put the records straight back on the wire, leaving peers
+  ;; holding them until TTL.
+  (setf (responder-stopping responder) t
+        (responder-running responder) nil)
   ;; Best-effort: withdraw everything we advertised before going away, so peers
   ;; drop our records immediately instead of waiting for TTL expiry.
   (dolist (info (bordeaux-threads:with-lock-held ((responder-lock responder))
                   (copy-list (responder-services responder))))
     (ignore-errors (send-goodbye responder info)))
-  (setf (responder-running responder) nil)
-  (dolist (socket (responder-sockets responder))
+  ;; Snapshot under the lock: the sweeper's interface rescan may be adding or
+  ;; dropping sockets right now, and a socket read outside it could be missed
+  ;; entirely — left open with its listener never joined.
+  (dolist (socket (responder-sockets-snapshot responder))
     (close-mdns-socket socket))
-  (dolist (thread (list* (responder-sweeper responder) (responder-resolver responder)
-                         (responder-threads responder)))
+  (dolist (thread (bordeaux-threads:with-lock-held ((responder-lock responder))
+                    (list* (responder-sweeper responder) (responder-resolver responder)
+                           (copy-list (responder-threads responder)))))
     (when (and thread (bordeaux-threads:thread-alive-p thread))
       (ignore-errors (bordeaux-threads:join-thread thread))))
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (setf (responder-sockets responder) '()
+          (responder-threads responder) '()))
   responder)
 
 ;;; --- inbound ---------------------------------------------------------------
@@ -363,20 +385,6 @@ that owns it, or all the services sharing it as their host name."
                        (string-equal (service-info-host info) name)))
                  (responder-services responder)))
 
-(defun detect-record-conflicts (responder records &optional (now (get-universal-time)))
-  "Queue the names in RECORDS that contradict our own unique records (§9).  The
-work itself is deferred to the resolver thread: probing sleeps for seconds, and
-this runs on a listener that must stay free to receive.
-
-A goodbye (ttl 0) is a withdrawal, not a competing claim, so it never counts."
-  (bordeaux-threads:with-lock-held ((responder-lock responder))
-    (dolist (incoming records)
-      (when (and (plusp (rr-ttl incoming))
-                 (conflicting-record-p (responder-records responder) incoming))
-        (push now (responder-conflict-times responder))
-        (pushnew (rr-name incoming) (responder-conflicted responder)
-                 :test #'string-equal)))))
-
 (defparameter *conflict-burst-count* 15
   "Conflicts within *CONFLICT-BURST-WINDOW* seconds that trip the §8.1 limit.")
 
@@ -390,15 +398,38 @@ the host MUST wait at least five seconds before each successive additional probe
 attempt.\"  This is the backstop against a buggy or hostile peer goading us into
 flooding the link with probes.")
 
+(defun trim-conflict-times (responder now)
+  "Drop conflict timestamps that have aged out of the burst window.  Caller holds
+the lock."
+  (setf (responder-conflict-times responder)
+        (remove-if (lambda (ts) (< ts (- now *conflict-burst-window*)))
+                   (responder-conflict-times responder))))
+
+(defun detect-record-conflicts (responder records &optional (now (get-universal-time)))
+  "Queue the names in RECORDS that contradict our own unique records (§9).  The
+work itself is deferred to the resolver thread: probing sleeps for seconds, and
+this runs on a listener that must stay free to receive.
+
+A goodbye (ttl 0) is a withdrawal, not a competing claim, so it never counts."
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    ;; Trim here, not only in CONFLICT-RATE-LIMITED-P: that runs only once a
+    ;; conflict maps to a service, so a conflicting record with nothing behind it
+    ;; — a stale unique record, a name we have since unregistered — would grow
+    ;; this list a cons per packet, forever.
+    (trim-conflict-times responder now)
+    (dolist (incoming records)
+      (when (and (plusp (rr-ttl incoming))
+                 (conflicting-record-p (responder-records responder) incoming))
+        (push now (responder-conflict-times responder))
+        (pushnew (rr-name incoming) (responder-conflicted responder)
+                 :test #'string-equal)))))
+
 (defun conflict-rate-limited-p (responder &optional (now (get-universal-time)))
   "True when *CONFLICT-BURST-COUNT* conflicts have landed within the last
 *CONFLICT-BURST-WINDOW* seconds.  Trims the window as it goes, so the timestamp
 list cannot grow without bound."
   (bordeaux-threads:with-lock-held ((responder-lock responder))
-    (let ((recent (remove-if (lambda (ts) (< ts (- now *conflict-burst-window*)))
-                             (responder-conflict-times responder))))
-      (setf (responder-conflict-times responder) recent)
-      (>= (length recent) *conflict-burst-count*))))
+    (>= (length (trim-conflict-times responder now)) *conflict-burst-count*)))
 
 (defun take-conflicted (responder)
   "Return and clear the queued conflicted names."
@@ -406,21 +437,32 @@ list cannot grow without bound."
     (prog1 (responder-conflicted responder)
       (setf (responder-conflicted responder) '()))))
 
+(defun same-record-p (a b)
+  "Two records are the same advertisement: same name, same type, same rdata."
+  (and (string-equal (rr-name a) (rr-name b))
+       (= (rr-type a) (rr-type b))
+       (rdata-equal a b)))
+
 (defun withdraw-service-records (responder info)
-  "Drop INFO's records from our authoritative set.  Caller holds the lock."
-  (let ((instance (service-instance-name info)))
+  "Drop INFO's records from our authoritative set — but only the ones no other
+registered service still claims.  Caller holds the lock.
+
+Several services can share a host name, and each contributes its own copy of
+that host's address and NSEC records.  Withdrawing every record INFO generates
+would strip those shared records out from under the services that are staying,
+leaving them with an SRV pointing at a host we no longer answer for."
+  (setf (responder-services responder) (remove info (responder-services responder)))
+  (let ((instance (service-instance-name info))
+        (going (service-info-records info))
+        (still-claimed (loop for other in (responder-services responder)
+                             append (service-info-records other))))
     (setf (responder-records responder)
-          (set-difference (responder-records responder) (service-info-records info)
-                          :test (lambda (a b)
-                                  (and (string-equal (rr-name a) (rr-name b))
-                                       (= (rr-type a) (rr-type b))
-                                       (rdata-equal a b))))
-          (responder-services responder)
-          (remove info (responder-services responder)))
-    ;; PTRs point *at* the instance rather than living at its name.
-    (setf (responder-records responder)
-          (remove-if (lambda (r) (and (typep r 'ptr-record)
-                                      (string-equal (ptr-target r) instance)))
+          (remove-if (lambda (r)
+                       (and (or (member r going :test #'same-record-p)
+                                ;; PTRs point *at* the instance, not at its name.
+                                (and (typep r 'ptr-record)
+                                     (string-equal (ptr-target r) instance)))
+                            (not (member r still-claimed :test #'same-record-p))))
                      (responder-records responder)))))
 
 (defun resolve-conflict (responder name)
@@ -437,10 +479,14 @@ re-probes the old one and loses again."
           (withdraw-service-records responder info))
         ;; The host must be probed afresh, so forget that we ever claimed it.
         (remhash name (responder-claimed-hosts responder)))
-      (when (conflict-rate-limited-p responder)
+      (when (and (conflict-rate-limited-p responder)
+                 (not (responder-stopping responder)))
         (sleep *conflict-burst-delay*))
       (dolist (info affected)
-        (ignore-errors (register-service responder info))))))
+        ;; A stop that began while we were probing has already sent the goodbyes;
+        ;; re-registering now would put the records back on the wire behind it.
+        (unless (responder-stopping responder)
+          (ignore-errors (register-service responder info)))))))
 
 (defparameter *conflict-poll-interval* 0.25
   "Seconds the §9 resolver sleeps between checks of the conflicted-name queue.")
@@ -450,7 +496,8 @@ re-probes the old one and loses again."
   (loop while (responder-running responder) do
     (sleep *conflict-poll-interval*)
     (dolist (name (take-conflicted responder))
-      (ignore-errors (resolve-conflict responder name)))))
+      (unless (responder-stopping responder)
+        (ignore-errors (resolve-conflict responder name))))))
 
 ;;; --- §8.2 lexicographic tiebreaking ---------------------------------------
 
@@ -583,8 +630,20 @@ negative response."
 
 (defun legacy-query-p (port)
   "A query from a source port other than 5353 is a one-shot legacy resolver
-(RFC 6762 §6.7): reply unicast, echo the id, repeat the question, cap TTLs."
-  (/= port +mdns-port+))
+(RFC 6762 §6.7): reply unicast, echo the id, repeat the question, cap TTLs.
+
+A NIL port means the peer address could not be decoded at all, so there is no
+unicast destination to reply to — treat it as an ordinary multicast query."
+  (and port (/= port +mdns-port+)))
+
+(defun unicast-reply-p (legacy questions host port)
+  "Whether to answer straight back to the asker instead of to the group: either a
+legacy resolver (§6.7) or a question with the QU bit set (§5.4).  Without a peer
+address we have nowhere to send it, so the answer goes to the group as usual."
+  (and host port
+       (or legacy
+           (and questions (question-unicast-response (first questions)))
+           nil)))
 
 (defparameter *legacy-max-ttl* 10
   "Cap (seconds) on TTLs in legacy unicast responses (RFC 6762 §6.7).")
@@ -604,23 +663,41 @@ negative response."
 
 (defun response-packets (query answers additionals legacy)
   "Encode a response as one or more packets, none over *MAX-MESSAGE-SIZE*
-(RFC 6762 §17).  Answers and additionals are distributed together in order, each
-packet carrying whichever of them landed in it; a legacy unicast reply repeats
-the question in every packet, so each one stands alone as an answer to that
-query.  Returns a list of octet vectors."
-  (flet ((message-for (tagged)
-           (make-response-message
-            query
-            (loop for (tag . r) in tagged when (eq tag :answer) collect r)
-            (loop for (tag . r) in tagged when (eq tag :additional) collect r)
-            legacy)))
-    (let ((tagged (append (mapcar (lambda (r) (cons :answer r)) answers)
-                          (mapcar (lambda (r) (cons :additional r)) additionals))))
-      (mapcar (lambda (group) (encode-message (message-for group)))
-              (chunk-records tagged *max-message-size*
-                             (lambda (group first)
-                               (declare (ignore first))
-                               (message-for group)))))))
+(RFC 6762 §17).  A legacy unicast reply repeats the question in every packet, so
+each one stands alone as an answer to that query.  Returns a list of octet
+vectors.
+
+The answers are what gets split; the additionals ride along in whatever room is
+left after them.  Additionals are supporting records — RFC 6763 §12 wants the
+SRV/TXT/A backing a PTR in the same datagram as the PTR — so any that do not fit
+are dropped rather than sent in a trailing packet of their own, which would
+arrive with ANCOUNT=0 and none of the answers they exist to support.  A querier
+that misses them just asks.
+
+With no answers at all — a peer multicast every one of ours during the response
+delay — the additionals are all there is, and they travel by themselves."
+  (flet ((message-for (as ads) (make-response-message query as ads legacy)))
+    (if (null answers)
+        (mapcar (lambda (group) (encode-message (message-for '() group)))
+                (chunk-records additionals *max-message-size*
+                               (lambda (group first)
+                                 (declare (ignore first))
+                                 (message-for '() group))))
+        (let ((pending additionals))
+          (loop for group in (chunk-records answers *max-message-size*
+                                            (lambda (g first)
+                                              (declare (ignore first))
+                                              (message-for g '())))
+                collect (let ((extras '()))
+                          (loop
+                            (when (null pending) (return))
+                            (let ((candidate (append extras (list (first pending)))))
+                              (if (<= (length (encode-message (message-for group candidate)))
+                                      *max-message-size*)
+                                  (setf extras candidate
+                                        pending (rest pending))
+                                  (return))))
+                          (encode-message (message-for group extras))))))))
 
 (defun surviving-answers (answers cache already-matched)
   "Drop answers a *peer* multicast during our response delay: an answer now in
@@ -637,9 +714,7 @@ cache match up front (e.g. our own looped-back records), which we keep."
     (when (or answers additionals)
       (let* ((questions (dns-message-questions message))
              (legacy (legacy-query-p port))
-             (unicast (or legacy
-                          (and questions
-                               (question-unicast-response (first questions))))))
+             (unicast (unicast-reply-p legacy questions host port)))
         (cond
           (unicast
            ;; Immediate, no aggregation delay or suppression.
@@ -684,15 +759,35 @@ cache match up front (e.g. our own looped-back records), which we keep."
               (format nil "~A (2)" name)))
         (format nil "~A (2)" name))))
 
+(defun probe-packets (name info)
+  "The probe query for NAME, split across packets if the proposed record set does
+not fit one datagram (§17).  The question rides in the first packet only; the
+proposed records go in the Authority section, which §8.2 tiebreaking compares."
+  (let ((question (make-question :name name :qtype +type-any+ :unicast-response t)))
+    (flet ((message-for (group first)
+             (make-dns-message :questions (if first (list question) '())
+                               :authorities group)))
+      (let ((groups (or (chunk-records (service-info-records info)
+                                       *max-message-size* #'message-for)
+                        (list '()))))
+        (loop for group in groups
+              for i from 1
+              collect (encode-message (message-for group (= i 1))))))))
+
 (defun send-probe (responder name info)
   "One probe: a unicast-response query for NAME with our proposed records in the
-Authority section (for tiebreaking), per RFC 6762 §8.1."
-  (broadcast responder
-             (encode-message
-              (make-dns-message
-               :questions (list (make-question :name name :qtype +type-any+
-                                               :unicast-response t))
-               :authorities (service-info-records info)))))
+Authority section (for tiebreaking), per RFC 6762 §8.1.
+
+Signals rather than quietly sending nothing.  MDNS-SEND drops a message over the
+§17 ceiling, and to PROBE-CYCLE a dropped probe is indistinguishable from a probe
+nobody answered — it would see no conflict and claim a name it had never actually
+probed for."
+  (let ((packets (probe-packets name info)))
+    (when (some (lambda (p) (> (length p) +hard-max-message-size+)) packets)
+      (error "0conf: cannot probe ~S — a single record exceeds the RFC 6762 §17 ~
+ceiling of ~D octets, so the probe cannot be put on the wire."
+             name +hard-max-message-size+))
+    (broadcast-packets responder packets)))
 
 (defun bump-hostname-label (label)
   "\"myhost\" -> \"myhost-2\", \"myhost-2\" -> \"myhost-3\" (RFC 6762 §9 hostnames)."
@@ -724,7 +819,9 @@ conflict was detected during the window."
        (dotimes (i 3)
          (send-probe responder name info)
          (sleep 0.25)
-         (when (responder-conflict responder) (return)))
+         (when (or (responder-conflict responder)
+                   (responder-stopping responder))
+           (return)))
     (bordeaux-threads:with-lock-held ((responder-lock responder))
       (setf (responder-probing responder) nil
             (responder-probe-records responder) '())))
@@ -749,6 +846,7 @@ RFC 6762 §8.3 asks for at least two, at least 1s apart.  A record set too big
 for one datagram goes out as several (§17)."
   (let ((packets (response-packets nil records '() nil)))
     (dotimes (i 2)
+      (when (responder-stopping responder) (return))
       (broadcast-packets responder packets)
       (sleep *announce-interval*))))
 
@@ -757,16 +855,19 @@ for one datagram goes out as several (§17)."
 conflict, RFC 6762 §8/§9), then announces its record set.  Records are built
 *after* probing so any rename is reflected."
   (when probe
-    ;; Claim the unique instance name.
-    (claim-name responder info #'service-instance-name
-                (lambda (i) (setf (service-info-name i)
-                                  (next-instance-name (service-info-name i)))))
-    ;; Claim the host name, once per host (many services can share it).
-    (unless (gethash (service-info-host info) (responder-claimed-hosts responder))
-      (claim-name responder info #'service-info-host
-                  (lambda (i) (setf (service-info-host i)
-                                    (next-host-name (service-info-host i)))))
-      (setf (gethash (service-info-host info) (responder-claimed-hosts responder)) t)))
+    ;; One claim at a time: the probe state is a single set of slots on the
+    ;; responder, and the §9 resolver probes from its own thread.
+    (bordeaux-threads:with-lock-held ((responder-claim-lock responder))
+      ;; Claim the unique instance name.
+      (claim-name responder info #'service-instance-name
+                  (lambda (i) (setf (service-info-name i)
+                                    (next-instance-name (service-info-name i)))))
+      ;; Claim the host name, once per host (many services can share it).
+      (unless (gethash (service-info-host info) (responder-claimed-hosts responder))
+        (claim-name responder info #'service-info-host
+                    (lambda (i) (setf (service-info-host i)
+                                      (next-host-name (service-info-host i)))))
+        (setf (gethash (service-info-host info) (responder-claimed-hosts responder)) t))))
   (let ((records (service-info-records info)))
     (bordeaux-threads:with-lock-held ((responder-lock responder))
       (push info (responder-services responder))
@@ -802,16 +903,19 @@ caches.  INFO must already be registered."
     (broadcast-packets responder (response-packets nil goodbye '() nil))))
 
 (defun unregister-service (responder info)
-  "Send a goodbye and drop INFO's records."
+  "Send a goodbye and drop INFO's records.
+
+Withdrawal goes through WITHDRAW-SERVICE-RECORDS so the host's address and NSEC
+records go too — removing only the records living at the *instance* name left
+those behind with no service standing behind them, so the responder kept
+answering for a host it had stopped advertising, and (once §9 arrived) kept
+detecting conflicts for a name it could no longer act on."
   (send-goodbye responder info)
-  (let ((instance (service-instance-name info)))
-    (bordeaux-threads:with-lock-held ((responder-lock responder))
-      (setf (responder-services responder)
-            (remove info (responder-services responder)))
-      (setf (responder-records responder)
-            (remove-if (lambda (r)
-                         (or (string-equal (rr-name r) instance)
-                             (and (typep r 'ptr-record)
-                                  (string-equal (ptr-target r) instance))))
-                       (responder-records responder)))))
+  (bordeaux-threads:with-lock-held ((responder-lock responder))
+    (withdraw-service-records responder info)
+    ;; Only forget the host claim once nothing is using the host any more.
+    (let ((host (service-info-host info)))
+      (unless (find host (responder-services responder)
+                    :key #'service-info-host :test #'string-equal)
+        (remhash host (responder-claimed-hosts responder)))))
   info)

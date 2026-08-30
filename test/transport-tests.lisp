@@ -354,3 +354,18 @@ every five seconds is worse."
       (0conf::usable-socket-specs ifaces 2)
       (0conf::usable-socket-specs ifaces 2))
     (is (= 1 warnings))))
+
+(test only-a-failed-syscall-falls-back-to-the-blocking-receive
+  "RECVMSG-UNAVAILABLE is signalled just for the syscall.  A decoding error
+happens after the datagram has been consumed, and the fallback is a blocking
+read with no timeout — taking it there would park the listener until some
+unrelated packet turned up."
+  (is (subtypep '0conf::recvmsg-unavailable 'error))
+  ;; The syscall's own condition is what the fallback handler catches ...
+  (is (eq :fell-back (handler-case (error '0conf::recvmsg-unavailable :fd 7)
+                       (0conf::recvmsg-unavailable () :fell-back))))
+  ;; ... and an ordinary decoding error escapes it, reaching the listener, which
+  ;; drops the packet and carries on instead of parking on a blocking read.
+  (is-true (nth-value 1 (ignore-errors
+                         (handler-case (error "decode")
+                           (0conf::recvmsg-unavailable () :fell-back))))))

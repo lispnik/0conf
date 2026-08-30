@@ -266,3 +266,26 @@ the last sets TC, and no known answer is lost."
       (is (= 1 (length (dns-message-questions m))))
       (is (null (dns-message-answers m)))
       (is (not (0conf::message-truncated-p m))))))
+
+(test chunking-bisects-instead-of-encoding-once-per-record
+  "Appending a record can only lengthen the encoding — compression never shrinks
+what came before — so the fit is monotonic and can be bisected.  The linear walk
+this replaces cost one full re-encode per record appended, on the listener thread
+inside the reply path."
+  (let* ((records (loop for i from 0 below 200
+                        collect (make-instance 'a-record
+                                               :name (format nil "host~D.local" i)
+                                               :cache-flush t :ttl 120
+                                               :address (parse-ipv4 "10.0.0.1"))))
+         (calls 0)
+         (groups (0conf::chunk-records records 0conf::*max-message-size*
+                                       (lambda (g first)
+                                         (incf calls)
+                                         (response-of g first)))))
+    ;; Same split as before, nothing lost or reordered ...
+    (is (equal records (apply #'append groups)))
+    (is (every (lambda (g)
+                 (<= (length (encode-message (response-of g))) 0conf::*max-message-size*))
+               groups))
+    ;; ... for fewer encodes than there are records.
+    (is (< calls (length records)))))

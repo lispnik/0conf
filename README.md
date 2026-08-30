@@ -163,7 +163,7 @@ Dependencies are managed with [ocicl](https://github.com/ocicl/ocicl):
 
 ```sh
 ocicl install                             # restore deps from ocicl.csv
-sbcl --eval '(asdf:test-system :0conf)'   # 142 tests / 368 checks, pure + loopback
+sbcl --eval '(asdf:test-system :0conf)'   # 159 tests / 431 checks, pure + loopback
 ```
 
 The test suite is mostly pure (codec / records / cache / DNS-SD), plus
@@ -246,10 +246,14 @@ QU bit, header flags), not just our own encoder's output.
   packets as it needs, each kept under 1400 bytes (the RFC allows up to the MTU
   less IP+UDP headers, but advises staying under 1500). Because name compression
   makes a record's encoded length depend on what precedes it, each candidate
-  packet is *measured by encoding it* rather than by summing per-record sizes. A
-  single record too large to share a datagram travels alone, as §17 permits, and
+  packet is *measured by encoding it* rather than by summing per-record sizes —
+  bisected, since appending a record can only lengthen the encoding. A single
+  record too large to share a datagram travels alone, as §17 permits, and
   anything past the 9000-byte hard ceiling is dropped at the transport instead of
-  being put on the wire. A query carrying a known-answer list splits the §7.2
+  being put on the wire; a *probe* that would be dropped signals instead, since a
+  probe nobody sent looks exactly like a probe nobody answered. Additionals ride
+  in whatever room is left after the answers rather than stranding themselves in
+  a trailing packet with no answer to support (RFC 6763 §12). A query carrying a known-answer list splits the §7.2
   way: the question rides in the first packet only, and every packet but the last
   sets the TC bit — the sending half of the multipacket known-answer suppression
   the responder already understood on receive.

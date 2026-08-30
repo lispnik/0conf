@@ -548,3 +548,258 @@ never fabricated."
                  (is (typep ifindex '(or null (integer 1 *))))))
           (close-mdns-socket a)
           (close-mdns-socket b))))))
+
+;;; --- withdrawal must not disturb the services that are staying -------------
+
+(defun two-services-sharing-a-host ()
+  "Two registered services on one host name.  Returns (values responder http ipp)."
+  (let ((r (make-responder))
+        (http (make-service-info :type "_http._tcp.local" :name "Web" :host "myhost.local"
+                                 :port 80 :addresses (list (parse-ipv4 "10.0.0.7"))))
+        (ipp (make-service-info :type "_ipp._tcp.local" :name "Print" :host "myhost.local"
+                                :port 631 :addresses (list (parse-ipv4 "10.0.0.7")))))
+    (register-service r http :probe nil)
+    (register-service r ipp :probe nil)
+    (values r http ipp)))
+
+(defun host-address-records (responder host)
+  (count-if (lambda (x) (and (typep x 'a-record) (string-equal (rr-name x) host)))
+            (0conf::responder-records responder)))
+
+(test withdrawing-one-service-leaves-a-shared-host-intact
+  "Two services on one host each contribute their own copy of its address and
+NSEC records.  Withdrawing one must not take the other's copies with it, or the
+service that stayed is left with an SRV pointing at a host we no longer answer
+for."
+  (multiple-value-bind (r http ipp) (two-services-sharing-a-host)
+    (is (= 2 (host-address-records r "myhost.local")))
+    (bordeaux-threads:with-lock-held ((0conf::responder-lock r))
+      (0conf::withdraw-service-records r http))
+    (is (equal (list ipp) (0conf::responder-services r)))
+    ;; the staying service still has an address at its host ...
+    (is (plusp (host-address-records r "myhost.local")))
+    ;; ... its own records are untouched ...
+    (is (find-if (lambda (x) (and (typep x 'srv-record)
+                                  (string-equal (rr-name x) "Print._ipp._tcp.local")))
+                 (0conf::responder-records r)))
+    (is (find-if (lambda (x) (and (typep x 'nsec-record)
+                                  (string-equal (rr-name x) "myhost.local")))
+                 (0conf::responder-records r)))
+    ;; ... and the withdrawn one really is gone.
+    (is (not (find-if (lambda (x) (string-equal (rr-name x) "Web._http._tcp.local"))
+                      (0conf::responder-records r))))
+    (is (not (find-if (lambda (x) (and (typep x 'ptr-record)
+                                       (string-equal (ptr-target x) "Web._http._tcp.local")))
+                      (0conf::responder-records r))))))
+
+(test withdrawing-the-last-service-on-a-host-takes-the-host-records-too
+  (multiple-value-bind (r http ipp) (two-services-sharing-a-host)
+    (bordeaux-threads:with-lock-held ((0conf::responder-lock r))
+      (0conf::withdraw-service-records r http)
+      (0conf::withdraw-service-records r ipp))
+    (is (null (0conf::responder-services r)))
+    (is (zerop (host-address-records r "myhost.local")))
+    (is (null (0conf::responder-records r)))))
+
+(test unregistering-clears-the-host-records-it-was-holding
+  "Removing only the records at the instance name left the host's address and
+NSEC behind, so the responder kept answering for a host it no longer advertised."
+  (multiple-value-bind (r info) (registered-responder)
+    (unregister-service r info)
+    (is (null (0conf::responder-services r)))
+    (is (zerop (host-address-records r "myhost.local")))
+    (is (null (0conf::responder-records r)))
+    (is (zerop (hash-table-count (0conf::responder-claimed-hosts r))))))
+
+(test unregistering-one-of-two-services-keeps-the-others-host-records
+  (multiple-value-bind (r http ipp) (two-services-sharing-a-host)
+    (declare (ignore ipp))
+    (unregister-service r http)
+    (is (plusp (host-address-records r "myhost.local")))
+    (is (find-if (lambda (x) (and (typep x 'srv-record)
+                                  (string-equal (rr-name x) "Print._ipp._tcp.local")))
+                 (0conf::responder-records r)))))
+
+;;; --- one claim at a time, and a clean stop ---------------------------------
+
+(test probing-is-serialized-by-the-claim-lock
+  "The probe state is a single set of slots on the responder, so only one name
+may be claimed at a time.  Before §9 the only prober was whichever thread called
+REGISTER-SERVICE; the resolver is now a second one, and two overlapping probes
+would read each other's conflict flag."
+  (let* ((r (make-responder))
+         (info (make-service-info :type "_x._tcp.local" :name "N" :host "h.local"
+                                  :port 1 :addresses (list (parse-ipv4 "10.0.0.1"))))
+         (done nil)
+         (worker nil))
+    (bordeaux-threads:acquire-lock (0conf::responder-claim-lock r))
+    (unwind-protect
+         (progn
+           (setf worker (bordeaux-threads:make-thread
+                         (lambda () (register-service r info) (setf done t))
+                         :name "0conf-test-registrar"))
+           (sleep 0.3)
+           ;; Held up on the claim lock: it cannot have probed or registered.
+           (is (null (0conf::responder-services r)))
+           (is (null done)))
+      (bordeaux-threads:release-lock (0conf::responder-claim-lock r)))
+    (bordeaux-threads:join-thread worker)
+    ;; NB: IS-TRUE, not IS — FiveAM's IS wants a predicate form to report on and
+    ;; refuses a bare variable.
+    (is-true done)
+    (is (equal (list info) (0conf::responder-services r)))))
+
+(test stopping-stops-a-conflict-resolution-resurrecting-a-service
+  "STOP-RESPONDER sends the goodbyes and then joins the resolver.  A resolution
+already in flight finishes afterwards, and re-registering there would put the
+records back on the wire behind the goodbye — peers would hold them until TTL."
+  (multiple-value-bind (r info) (registered-responder)
+    (setf (0conf::responder-stopping r) t)
+    (0conf::resolve-conflict r (service-instance-name info))
+    (is (null (0conf::responder-services r)))
+    (is (null (0conf::responder-records r)))))
+
+(test a-responder-that-was-never-started-still-resolves-conflicts
+  "STOPPING is deliberately distinct from RUNNING being NIL, which is also true
+of a responder nobody has started — the unit tests drive those directly."
+  (multiple-value-bind (r info) (registered-responder)
+    (is (null (0conf::responder-running r)))
+    (is (null (0conf::responder-stopping r)))
+    (0conf::resolve-conflict r (service-instance-name info))
+    (is (equal (list info) (0conf::responder-services r)))))
+
+(test stopping-clears-the-sockets-and-threads-it-was-holding
+  (let* ((r (make-responder))
+         (s (handler-case (make-mdns-socket :multicast nil :port 0)
+              (error (e) (skip "loopback UDP unavailable: ~A" e) nil))))
+    (when s
+      (start-responder r :socket s)
+      (is (0conf::responder-running r))
+      (stop-responder r)
+      (is (0conf::responder-stopping r))
+      (is (null (0conf::responder-running r)))
+      (is (null (0conf::responder-sockets r)))
+      (is (null (0conf::responder-threads r))))))
+
+;;; --- probes obey the size rules too ----------------------------------------
+
+(test a-large-probe-is-split-rather-than-sent-oversized
+  "SEND-PROBE was the one sender left unchunked (§17)."
+  (let* ((addresses (loop for i from 1 to 200
+                          collect (parse-ipv4 (format nil "10.0.~D.~D"
+                                                      (floor i 256) (mod i 256)))))
+         (info (make-service-info :type "_x._tcp.local" :name "Many" :host "h.local"
+                                  :port 1 :addresses addresses))
+         (packets (0conf::probe-packets (service-instance-name info) info))
+         (messages (mapcar #'decode-message packets)))
+    (is (> (length packets) 1))
+    (is (every (lambda (p) (<= (length p) 0conf::*max-message-size*)) packets))
+    (is (= 1 (length (dns-message-questions (first messages)))))
+    (is (every (lambda (m) (null (dns-message-questions m))) (rest messages)))
+    ;; every proposed record still goes out, in the Authority section
+    (is (= (length (0conf::service-info-records info))
+           (loop for m in messages sum (length (dns-message-authorities m)))))))
+
+(test an-unsendable-probe-signals-instead-of-claiming-the-name
+  "MDNS-SEND drops anything over the §17 hard ceiling, and a dropped probe looks
+exactly like a probe nobody answered — PROBE-CYCLE would take the silence for
+success and claim a name it never probed for."
+  (let* ((txt (loop for i from 0 below 40
+                    collect (cons (format nil "k~2,'0D" i)
+                                  (make-string 240 :initial-element #\x))))
+         (info (make-service-info :type "_x._tcp.local" :name "Big" :host "h.local"
+                                  :port 1 :txt txt
+                                  :addresses (list (parse-ipv4 "10.0.0.1"))))
+         (r (make-responder)))
+    ;; the TXT alone is past the ceiling, so no split can rescue it
+    (is (> (reduce #'max (mapcar #'length (0conf::probe-packets "Big._x._tcp.local" info)))
+           0conf::+hard-max-message-size+))
+    (signals error (0conf::send-probe r "Big._x._tcp.local" info))))
+
+;;; --- an undecodable peer address must not break the reply path -------------
+
+(test an-undecodable-peer-is-answered-on-the-group
+  "PARSE-SOCKADDR-PEER yields NIL host and port for a sockaddr it cannot read.
+That used to reach LEGACY-QUERY-P as (/= NIL 5353) — a type error the listener
+swallowed, dropping the query.  With nowhere to send a unicast reply, the answer
+belongs on the multicast group."
+  (is (null (0conf::legacy-query-p nil)))
+  (is (0conf::legacy-query-p 61244))
+  (is (null (0conf::legacy-query-p +mdns-port+)))
+  ;; No peer address: never unicast, whatever the query asked for.
+  (is (null (0conf::unicast-reply-p t '() nil nil)))
+  (is (null (0conf::unicast-reply-p nil (list (make-question :name "x" :qtype +type-any+
+                                                             :unicast-response t))
+                                    nil nil)))
+  ;; With one, the two unicast cases still hold.
+  (is (0conf::unicast-reply-p t '() "10.0.0.1" 61244))
+  (is (0conf::unicast-reply-p nil (list (make-question :name "x" :qtype +type-any+
+                                                       :unicast-response t))
+                              "10.0.0.1" 5353))
+  (is (null (0conf::unicast-reply-p nil (list (make-question :name "x" :qtype +type-any+))
+                                    "10.0.0.1" 5353))))
+
+(test conflict-timestamps-do-not-pile-up-for-a-name-we-cannot-act-on
+  "A conflicting record with no service behind it queues a name the resolver can
+do nothing with, so the trim that used to live only in the rate-limit check never
+ran and the timestamp list grew a cons per packet forever."
+  (let ((r (make-responder))
+        (now (get-universal-time)))
+    ;; A stale unique record with no owning service — what UNREGISTER-SERVICE
+    ;; used to leave behind at the host name.
+    (setf (0conf::responder-records r)
+          (list (make-instance 'a-record :name "ghost.local" :cache-flush t :ttl 120
+                                         :address (parse-ipv4 "10.0.0.7"))))
+    (dotimes (i 50)
+      (0conf::detect-record-conflicts
+       r (list (peer-address-record "ghost.local" "10.0.0.99")) (- now 60)))
+    (is (= 50 (length (0conf::responder-conflict-times r))))
+    (is (null (0conf::conflicted-services r "ghost.local")) "nothing to resolve")
+    ;; The next conflict ages all of those out, rather than adding to them.
+    (0conf::detect-record-conflicts
+     r (list (peer-address-record "ghost.local" "10.0.0.99")) now)
+    (is (= 1 (length (0conf::responder-conflict-times r))))))
+
+;;; --- additionals stay with the answers they support ------------------------
+
+(test additionals-never-travel-in-a-packet-of-their-own
+  "A split that landed inside the answers used to leave trailing packets holding
+only additionals — ANCOUNT=0, and none of the answers they exist to support."
+  (let* ((answers (loop for i from 0 below 60
+                        collect (make-instance 'txt-record
+                                               :name (format nil "a~D._x._tcp.local" i)
+                                               :cache-flush t :ttl 120
+                                               :strings (list (format nil "k=~A"
+                                                                      (make-string 60 :initial-element #\x))))))
+         (additionals (loop for i from 0 below 10
+                            collect (make-instance 'a-record :name (format nil "h~D.local" i)
+                                                             :cache-flush t :ttl 120
+                                                             :address (parse-ipv4 "10.0.0.1"))))
+         (packets (0conf::response-packets nil answers additionals nil))
+         (messages (mapcar #'decode-message packets)))
+    (is (> (length packets) 1))
+    (is (every (lambda (m) (plusp (length (dns-message-answers m)))) messages))
+    (is (= (length answers)
+           (loop for m in messages sum (length (dns-message-answers m)))))
+    (is (every (lambda (p) (<= (length p) 0conf::*max-message-size*)) packets))))
+
+(test an-additional-rides-with-its-answer-when-there-is-room
+  (let* ((answers (list (make-instance 'ptr-record :name "_x._tcp.local" :ttl 4500
+                                                   :target "I._x._tcp.local")))
+         (additionals (list (make-instance 'srv-record :name "I._x._tcp.local"
+                                                       :cache-flush t :ttl 120
+                                                       :port 1 :target "h.local")))
+         (packets (0conf::response-packets nil answers additionals nil)))
+    (is (= 1 (length packets)))
+    (let ((m (decode-message (first packets))))
+      (is (= 1 (length (dns-message-answers m))))
+      (is (= 1 (length (dns-message-additionals m)))))))
+
+(test additionals-alone-are-still-sent-when-every-answer-was-suppressed
+  "SURVIVING-ANSWERS can empty the answers while additionals remain."
+  (let* ((additionals (list (make-instance 'nsec-record :name "h.local" :next-name "h.local"
+                                                        :cache-flush t :ttl 120
+                                                        :types (list +type-a+))))
+         (packets (0conf::response-packets nil '() additionals nil)))
+    (is (= 1 (length packets)))
+    (is (= 1 (length (dns-message-additionals (decode-message (first packets))))))))

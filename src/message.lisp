@@ -92,19 +92,35 @@ answers) can special-case it."
         (pending records)
         (first t))
     (loop while pending do
-      (let ((group '()))
-        (loop while pending do
-          (let* ((candidate (append group (list (first pending))))
-                 (size (length (encode-message (funcall make-message candidate first)))))
-            ;; The first record in a group is taken unconditionally: something
-            ;; must go in, even if it alone busts the budget.
-            (if (or (null group) (<= size budget))
-                (setf group candidate
-                      pending (rest pending))
-                (return))))
-        (push group groups)
-        (setf first nil)))
+      (let ((n (prefix-that-fits pending budget make-message first)))
+        (push (subseq pending 0 n) groups)
+        (setf pending (nthcdr n pending)
+              first nil)))
     (nreverse groups)))
+
+(defun prefix-that-fits (records budget make-message first)
+  "How many of RECORDS go in one message of at most BUDGET octets — at least one,
+since a record too large for a packet of its own still has to travel somewhere.
+
+Bisected rather than walked.  Appending a record can only make the encoding
+longer: name compression lets a later name point back at an earlier one, never
+the other way about, so nothing already written shrinks and the fit is monotonic
+in the prefix length.  The walk this replaces re-encoded the whole candidate
+group once per record appended — quadratic, on the listener thread, inside the
+reply path."
+  (flet ((fits (n)
+           (<= (length (encode-message (funcall make-message (subseq records 0 n) first)))
+               budget)))
+    (let ((total (length records)))
+      (cond
+        ((fits total) total)
+        (t
+         ;; LO always fits (or is the one record we must take anyway); HI never does.
+         (let ((lo 1) (hi total))
+           (loop while (< (1+ lo) hi)
+                 do (let ((mid (floor (+ lo hi) 2)))
+                      (if (fits mid) (setf lo mid) (setf hi mid))))
+           lo))))))
 
 (defun query-message (questions known-answers &optional truncated)
   "A query carrying KNOWN-ANSWERS.  TRUNCATED sets the TC bit, which on an mDNS

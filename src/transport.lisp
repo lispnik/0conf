@@ -373,6 +373,15 @@ address does: offset 4 for v4, offset 8 for v6, past the flowinfo."
          (values (format-ipv6 (subseq octets 8 24)) (port)))
         (t (values nil nil))))))
 
+(define-condition recvmsg-unavailable (error)
+  ((fd :initarg :fd :reader recvmsg-unavailable-fd))
+  (:report (lambda (c stream)
+             (format stream "recvmsg() failed on fd ~D" (recvmsg-unavailable-fd c))))
+  (:documentation "The recvmsg() syscall itself failed, as opposed to something
+going wrong while decoding what it returned.  Only this is worth retrying on the
+plain receive path: once decoding is running the datagram has already been
+consumed, so falling back there would block waiting for a second one."))
+
 (defun recvmsg-datagram (fd max)
   "One datagram via recvmsg(), which unlike recvfrom() also hands back the
 ancillary data.  Returns (values octets peer-host peer-port interface-index)."
@@ -399,7 +408,7 @@ ancillary data.  Returns (values octets peer-host peer-port interface-index)."
               (sb-alien:slot msg 'msg-flags) 0)
         (let ((n (%recvmsg fd (sb-alien:addr msg) 0)))
           (when (minusp n)
-            (error "recvmsg() failed on fd ~D" fd))
+            (error 'recvmsg-unavailable :fd fd))
           (multiple-value-bind (host port)
               (parse-sockaddr-peer (subseq name 0 (min (length name)
                                                        (sb-alien:slot msg 'msg-namelen))))
@@ -633,7 +642,13 @@ assuming anything."
                  max)
     ;; recvmsg is the whole reason we can attribute an interface, but it must
     ;; never be the reason a datagram is lost: fall back to the plain path.
-    (error ()
+    ;; Only the syscall failing is caught here.  A decoding error happens *after*
+    ;; the datagram has been consumed, and the fallback is a blocking read with
+    ;; no timeout — taking it there would park the listener until some unrelated
+    ;; packet arrived, which is exactly the hang RESPONDER-LOOP's bounded wait
+    ;; exists to avoid.  Such an error propagates instead, and the listener drops
+    ;; the packet and carries on.
+    (recvmsg-unavailable ()
       (multiple-value-bind (buffer size host port)
           (sb-bsd-sockets:socket-receive (mdns-socket-socket mdns)
                                          (make-array max :element-type '(unsigned-byte 8))
